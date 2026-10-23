@@ -46,25 +46,33 @@ struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
-// Who waits for a command buffer to complete (tb128fu-047: the render server waited about 41 ms once per swap, so its next frame never
-// overlapped the GPU): the first two return addresses outside this plugin, as an image name and an offset from that image's header,
-// counted per distinct pair (rows C0..C3).
-struct WaitSite {const char *image[2];uintptr_t offset[2];uint64_t count;};
+// Who waits for a command buffer to complete (tb128fu-047: about 41 ms once per swap, so the next frame never overlapped the GPU;
+// tb128fu-049: every frame above the wait outside this plugin was the thread's start): the four return addresses above
+// waitUntilCompleted, each as one letter for its image (P this plugin, Q QuartzCore, M Metal, L libdispatch, T libsystem_pthread,
+// ? another) and its offset from that image's header, counted per distinct chain (rows C0..C3; P offsets resolve with the plugin's dSYM).
+struct WaitSite {char image[4];uintptr_t offset[4];uint64_t count;};
 static WaitSite gWaitSites[4];
 static std::mutex gWaitSiteLock;
+static char imageLetter(const char *path) {
+ if(strstr(path,"NativeAdrenoMetal"))return 'P';
+ if(strstr(path,"/QuartzCore"))return 'Q';
+ if(strstr(path,"/Metal.framework"))return 'M';
+ if(strstr(path,"libdispatch"))return 'L';
+ if(strstr(path,"libsystem_pthread"))return 'T';
+ return '?';
+}
 static void noteWaitSite() {
- void *frames[16];const int n=backtrace(frames,16);
- const char *image[2]={};uintptr_t offset[2]={};unsigned kept=0;
- for(int i=1;i<n && kept<2;i++) {
+ void *frames[8];const int n=backtrace(frames,8);
+ WaitSite seen{};
+ for(int i=2;i<n && i<6;i++) {   // 0 is this function, 1 waitUntilCompleted
   Dl_info info{};
-  if(!dladdr(frames[i],&info) || !info.dli_fname || strstr(info.dli_fname,"NativeAdrenoMetal"))continue;
-  const char *slash=strrchr(info.dli_fname,'/');
-  image[kept]=slash?slash+1:info.dli_fname;offset[kept]=(uintptr_t)frames[i]-(uintptr_t)info.dli_fbase;++kept;
+  if(!dladdr(frames[i],&info) || !info.dli_fname)continue;
+  seen.image[i-2]=imageLetter(info.dli_fname);seen.offset[i-2]=(uintptr_t)frames[i]-(uintptr_t)info.dli_fbase;
  }
  std::lock_guard<std::mutex> lock(gWaitSiteLock);
  for(auto &site:gWaitSites) {
-  if(site.count && site.offset[0]==offset[0] && site.offset[1]==offset[1]) {++site.count;return;}
-  if(!site.count) {site={{image[0],image[1]},{offset[0],offset[1]},1};return;}
+  if(site.count && !memcmp(site.offset,seen.offset,sizeof seen.offset)) {++site.count;return;}
+  if(!site.count) {site=seen;site.count=1;return;}
  }
 }
 static Timed gTimeResourceWait;
@@ -1724,9 +1732,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  {
   std::lock_guard<std::mutex> lock(gWaitSiteLock);
-  for(unsigned i=0;i<4 && gWaitSites[i].count;i++)
-   row("C%u x%llu %.20s+%lx < %.20s+%lx",i,(unsigned long long)gWaitSites[i].count,gWaitSites[i].image[0]?gWaitSites[i].image[0]:"?",
-    (unsigned long)gWaitSites[i].offset[0],gWaitSites[i].image[1]?gWaitSites[i].image[1]:"?",(unsigned long)gWaitSites[i].offset[1]);
+  for(unsigned i=0;i<4 && gWaitSites[i].count;i++) {
+   const WaitSite &w=gWaitSites[i];
+   row("C%u x%llu %c%lx %c%lx %c%lx %c%lx",i,(unsigned long long)w.count,w.image[0]?w.image[0]:'-',(unsigned long)w.offset[0],
+    w.image[1]?w.image[1]:'-',(unsigned long)w.offset[1],w.image[2]?w.image[2]:'-',(unsigned long)w.offset[2],
+    w.image[3]?w.image[3]:'-',(unsigned long)w.offset[3]);
+  }
  }
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
