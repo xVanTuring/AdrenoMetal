@@ -23,6 +23,9 @@ struct Frame {
     size_t bytes;     // allocation size, a multiple of the page size
     size_t stride;
     uint32_t width, height;
+    // The display driver's mapping cache (NGPSwap.reserved): 0x80 | slot | generation << 8 while that mapping stays the same, 0 for a
+    // mapping made for this frame only.
+    uint32_t tag = 0;
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
@@ -42,7 +45,25 @@ public:
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
-        id<MTLBuffer> source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        // The compositor cycles through a few surfaces and the display driver keeps this task's mapping of each (frame.tag): the import of
+        // a cached mapping is made once and reused, instead of pinning and mapping about 2400 pages into the GPU and back every frame.
+        id<MTLBuffer> source = nil;
+        if (frame.tag & 0x80) {
+            Cached &cached = cached_[frame.tag & 3];
+            if (cached.buffer && cached.tag == frame.tag && cached.base == frame.base && cached.bytes == frame.bytes) {
+                source = cached.buffer;
+                ++imports_[1];
+            } else {
+                cached.buffer = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+                cached.tag = frame.tag; cached.base = frame.base; cached.bytes = frame.bytes;
+                source = cached.buffer;
+                ++imports_[0];
+            }
+        } else {
+            source = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared deallocator:nil];
+            ++imports_[0];
+        }
         if (!source) return kNoResource;
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
@@ -83,6 +104,10 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
+    struct Cached {uint32_t tag = 0; const void *base = nullptr; size_t bytes = 0; id<MTLBuffer> buffer;};
+    Cached cached_[4];
+public:
+    uint64_t imports_[2] = {};   // surfaces imported, frames that reused an import
 };
 
 }  // namespace gpupresent

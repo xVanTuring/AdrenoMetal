@@ -33,6 +33,7 @@ struct Stats {
     uint64_t mismatchRows;   // rows of those frames that differ (CPU reads only: nothing is rendered or copied by the CPU)
     uint32_t lastMs;    // the GPU copy's time for the last frame
     uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
+    uint64_t imported, reused;   // surface imports made, and frames that reused one (Presenter's cache of the driver's mappings)
 };
 
 class Client {
@@ -81,12 +82,14 @@ public:
         note(0x6730);   // a frame was offered
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
-                                                          (size_t)swap.stride, swap.width, swap.height});
+                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved});
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);
             stats_->lastMs = (uint32_t)(((mach_absolute_time() - began) * base.numer / base.denom) / 1000000);
             stats_->totalMs += stats_->lastMs;
+            stats_->imported = presenter_->imports_[0];
+            stats_->reused = presenter_->imports_[1];
         }
         stats_->lastResult = (int)r;
         if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
