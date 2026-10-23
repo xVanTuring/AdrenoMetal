@@ -153,20 +153,25 @@ static void journal(const std::string &line) {
 // The render thread's CPU profile (U row: the compositor spends about 73 ms of CPU per frame). From the 200th commit with a render pass,
 // the committing thread is sampled about every millisecond: suspended, its registers read, its frame-pointer chain walked within its
 // stack (nothing is allocated while it is suspended: it may hold the allocator's lock), resumed. Identical stacks are counted together.
+// A sample of the thread waiting within 30 ms of a running one (between the frames of an animation, not at rest) is kept apart, with its
+// link register after the program counter: a wait is a system call whose leaf wrapper keeps the return address there (U row: the thread
+// runs about 37 of every 53 ms of a frame).
 // Once the thread has been idle for 5 s after new samples, profile.txt in the runtime's cache directory is rewritten (through a rename,
-// so the cache export never reads half a file): every address with its image, offset and dladdr's symbol, then each stack and its count.
+// so the cache export never reads half a file): every address with its image, offset and dladdr's symbol, then each running stack (S)
+// and each waiting stack (W) with its count.
 static std::string gProfilePath;
 static mach_port_t gProfiled;
 static uint64_t profileStrip(uint64_t address) {return address>>47?address&0x0000000FFFFFFFFFull:address;}
-static void writeProfile(const std::map<std::vector<uint64_t>,uint32_t> &stacks,uint64_t samples,uint64_t running,uint64_t since,
-                         std::unordered_map<uint64_t,std::string> &names) {
+static void writeProfile(const std::map<std::vector<uint64_t>,uint32_t> &stacks,const std::map<std::vector<uint64_t>,uint32_t> &waits,
+                         uint64_t samples,uint64_t running,uint64_t waiting,uint64_t since,std::unordered_map<uint64_t,std::string> &names) {
  std::unordered_map<uint64_t,uint32_t> index;std::vector<uint64_t> addresses;
- for(const auto &entry:stacks)for(uint64_t address:entry.first)if(index.emplace(address,(uint32_t)addresses.size()).second)addresses.push_back(address);
+ for(const auto *map:{&stacks,&waits})for(const auto &entry:*map)for(uint64_t address:entry.first)
+  if(index.emplace(address,(uint32_t)addresses.size()).second)addresses.push_back(address);
  const std::string temporary=gProfilePath+".new";
  FILE *f=fopen(temporary.c_str(),"w");
  if(!f)return;
- fprintf(f,"NBPROF1 samples=%llu running=%llu stacks=%zu addresses=%zu since=%llu\n",(unsigned long long)samples,(unsigned long long)running,
-         stacks.size(),addresses.size(),(unsigned long long)since);
+ fprintf(f,"NBPROF1 samples=%llu running=%llu waiting=%llu stacks=%zu addresses=%zu since=%llu\n",(unsigned long long)samples,
+         (unsigned long long)running,(unsigned long long)waiting,stacks.size(),addresses.size(),(unsigned long long)since);
  for(size_t i=0;i<addresses.size();i++) {
   const uint64_t address=addresses[i];
   auto known=names.find(address);
@@ -185,6 +190,11 @@ static void writeProfile(const std::map<std::vector<uint64_t>,uint32_t> &stacks,
   for(uint64_t address:entry.first)fprintf(f," %u",index[address]);
   fputc('\n',f);
  }
+ for(const auto &entry:waits) {
+  fprintf(f,"W %u",entry.second);
+  for(uint64_t address:entry.first)fprintf(f," %u",index[address]);
+  fputc('\n',f);
+ }
  fclose(f);
  rename(temporary.c_str(),gProfilePath.c_str());
 }
@@ -195,20 +205,22 @@ static void *profileLoop(void *) {
  if(pthread_t thread=pthread_from_mach_thread_np(target)) {
   stackHigh=(uintptr_t)pthread_get_stackaddr_np(thread);stackLow=stackHigh-pthread_get_stacksize_np(thread);
  }
- std::map<std::vector<uint64_t>,uint32_t> stacks;std::unordered_map<uint64_t,std::string> names;
- uint64_t samples=0,running=0,written=0,lastRunning=0;
+ std::map<std::vector<uint64_t>,uint32_t> stacks,waits;std::unordered_map<uint64_t,std::string> names;
+ uint64_t samples=0,running=0,waiting=0,written=0,lastRunning=0;
  const uint64_t since=nowUs();
  for(;;) {
   usleep(1000);
   thread_basic_info_data_t info{};mach_msg_type_number_t n=THREAD_BASIC_INFO_COUNT;
   if(thread_info(target,THREAD_BASIC_INFO,(thread_info_t)&info,&n)!=KERN_SUCCESS)break;   // the thread ended
   samples++;
-  if(info.run_state==TH_STATE_RUNNING) {
+  const bool isRunning=info.run_state==TH_STATE_RUNNING;
+  if(isRunning || (lastRunning && nowUs()-lastRunning<30000)) {
    uint64_t frames[20];unsigned depth=0;
    if(thread_suspend(target)==KERN_SUCCESS) {
     arm_thread_state64_t state{};mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
     if(thread_get_state(target,ARM_THREAD_STATE64,(thread_state_t)&state,&count)==KERN_SUCCESS) {
      frames[depth++]=profileStrip(arm_thread_state64_get_pc(state));
+     if(!isRunning)frames[depth++]=profileStrip(arm_thread_state64_get_lr(state));
      uintptr_t fp=(uintptr_t)arm_thread_state64_get_fp(state);
      while(depth<20 && fp>=stackLow && fp+16<=stackHigh && !(fp&7)) {
       const uintptr_t *record=(const uintptr_t *)fp;
@@ -221,9 +233,10 @@ static void *profileLoop(void *) {
     }
     thread_resume(target);
    }
-   if(depth){running++;stacks[std::vector<uint64_t>(frames,frames+depth)]++;lastRunning=nowUs();}
+   if(depth && isRunning){running++;stacks[std::vector<uint64_t>(frames,frames+depth)]++;lastRunning=nowUs();}
+   else if(depth){waiting++;waits[std::vector<uint64_t>(frames,frames+depth)]++;}
   }
-  if(running!=written && nowUs()-lastRunning>=5000000){writeProfile(stacks,samples,running,since,names);written=running;}
+  if(running!=written && nowUs()-lastRunning>=5000000){writeProfile(stacks,waits,samples,running,waiting,since,names);written=running;}
  }
  return nullptr;
 }
