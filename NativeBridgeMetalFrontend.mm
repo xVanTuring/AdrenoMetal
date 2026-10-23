@@ -46,6 +46,27 @@ struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
+// Who waits for a command buffer to complete (tb128fu-047: the render server waited about 41 ms once per swap, so its next frame never
+// overlapped the GPU): the first two return addresses outside this plugin, as an image name and an offset from that image's header,
+// counted per distinct pair (rows C0..C3).
+struct WaitSite {const char *image[2];uintptr_t offset[2];uint64_t count;};
+static WaitSite gWaitSites[4];
+static std::mutex gWaitSiteLock;
+static void noteWaitSite() {
+ void *frames[16];const int n=backtrace(frames,16);
+ const char *image[2]={};uintptr_t offset[2]={};unsigned kept=0;
+ for(int i=1;i<n && kept<2;i++) {
+  Dl_info info{};
+  if(!dladdr(frames[i],&info) || !info.dli_fname || strstr(info.dli_fname,"NativeAdrenoMetal"))continue;
+  const char *slash=strrchr(info.dli_fname,'/');
+  image[kept]=slash?slash+1:info.dli_fname;offset[kept]=(uintptr_t)frames[i]-(uintptr_t)info.dli_fbase;++kept;
+ }
+ std::lock_guard<std::mutex> lock(gWaitSiteLock);
+ for(auto &site:gWaitSites) {
+  if(site.count && site.offset[0]==offset[0] && site.offset[1]==offset[1]) {++site.count;return;}
+  if(!site.count) {site={{image[0],image[1]},{offset[0],offset[1]},1};return;}
+ }
+}
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
 static Timed gTimeSurfaceFlush;
@@ -965,6 +986,7 @@ static void scheduled(void *context);
 }
 - (void)waitUntilCompleted {
  if(!self.committed)return;
+ noteWaitSite();
  const uint64_t began=nowUs();
  if(!self.failedLocally)nmb_command_buffer_wait(_handle,0);
  dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
@@ -1700,6 +1722,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
  row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
+ {
+  std::lock_guard<std::mutex> lock(gWaitSiteLock);
+  for(unsigned i=0;i<4 && gWaitSites[i].count;i++)
+   row("C%u x%llu %.20s+%lx < %.20s+%lx",i,(unsigned long long)gWaitSites[i].count,gWaitSites[i].image[0]?gWaitSites[i].image[0]:"?",
+    (unsigned long)gWaitSites[i].offset[0],gWaitSites[i].image[1]?gWaitSites[i].image[1]:"?",(unsigned long)gWaitSites[i].offset[1]);
+ }
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
