@@ -1,0 +1,18 @@
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index a0a2cbc..d9d6e79 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -819,7 +819,12 @@ pub(super) fn holding(
+         return Ok(Holds::Texels);
+     };
+     let reads = only_reads(usage);
+-    if reads && policy == PaddedReadsPolicy::Alias {
++    // Under the default policy a texture that renders or writes aliases the bytes between its rows
++    // too. On Turnip a linear image's layout transitions touch no memory, and a pass's load and
++    // store reach the bytes past a row's texels at most up to its pitch (a GMEM store's tile
++    // alignment), which no program reads: the render server's 1200x2000 surfaces lie 4864 bytes
++    // apart, Turnip's own linear pitch, and their shadows' copies took 5 ms of GPU time a pass.
++    if policy == PaddedReadsPolicy::Alias {
+         return Ok(Holds::Padding);
+     }
+     let writers = if usage.contains(TextureUsage::RENDER_TARGET) {
