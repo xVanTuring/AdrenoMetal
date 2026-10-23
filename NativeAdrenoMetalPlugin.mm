@@ -196,6 +196,22 @@ static id clientDevice(unsigned port) {
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
     return device;
 }
+// Turnip options a board asks for through the accelerator's NativeTurnipDebug property: they replace this plugin's default below
+// (they are set first, the default does not overwrite), before anything in this process loads Turnip (it parses the variable once).
+// The Adreno 610 board needs "noconform": Turnip reports Vulkan 1.0 on a6xx gen1, which has no hardware multiview
+// (tu_has_multiview), and the Metal runtime needs 1.2; noconform reports 1.3 there. It also has no concurrent binning, so whether it
+// renders in system memory is the board's choice. Without the property nothing changes.
+static void applyBoardTurnipDebug(unsigned port) {
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+    auto copyProperty = iokit ? (CFTypeRef (*)(unsigned, CFStringRef, CFAllocatorRef, uint32_t))dlsym(iokit, "IORegistryEntryCreateCFProperty")
+                              : nullptr;
+    CFTypeRef value = copyProperty ? copyProperty(port, CFSTR("NativeTurnipDebug"), kCFAllocatorDefault, 0) : nullptr;
+    if (!value) return;
+    char text[128];
+    if (CFGetTypeID(value) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) value, text, sizeof text, kCFStringEncodingUTF8))
+        setenv("TU_DEBUG", text, 1);
+    CFRelease(value);
+}
 static id deviceForPort(unsigned port) {
     static id device;
     static bool tried;
@@ -208,6 +224,7 @@ static id deviceForPort(unsigned port) {
         // BR one IB ahead, BV inside a draw IB2). int-257's nobin covered the render server only. System memory alone still let BV run
         // ahead of BR across passes (concurrent binning is emitted for sysmem passes too) and it hung the same way in int-265: no
         // concurrent binning either.
+        applyBoardTurnipDebug(port);
         setenv("TU_DEBUG", "sysmem,nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
