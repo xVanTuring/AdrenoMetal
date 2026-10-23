@@ -80,6 +80,24 @@ static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
 static Timed gTimeSurfaceFlush;
 static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
 struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
+// Where the compositor's frames are prepared: at each commit with a render pass, the committing thread's CPU time (user and system) and
+// the wall time since its previous such commit, and the core it committed from (TPIDR_EL0's CPU number; on SM6225 cores 0-3 are the
+// A53s, 4-7 the A73s). A gap past 200 ms is the compositor at rest and is not counted.
+static std::atomic<uint64_t> gFrameCostN,gFrameCpuUs,gFrameWallUs,gFrameCores[8];
+static void noteFrameCost() {
+ static thread_local uint64_t lastCpu,lastWall;
+ uint64_t tpidr;__asm__ volatile("mrs %0, TPIDR_EL0":"=r"(tpidr));
+ const unsigned core=(unsigned)(tpidr&0xfff);
+ thread_basic_info_data_t t{};mach_msg_type_number_t n=THREAD_BASIC_INFO_COUNT;mach_port_t self=mach_thread_self();
+ const bool ok=thread_info(self,THREAD_BASIC_INFO,(thread_info_t)&t,&n)==KERN_SUCCESS;
+ mach_port_deallocate(mach_task_self(),self);
+ if(!ok)return;
+ const uint64_t cpu=(uint64_t)(t.user_time.seconds+t.system_time.seconds)*1000000+t.user_time.microseconds+t.system_time.microseconds;
+ const uint64_t wall=nowUs();
+ if(core<8)gFrameCores[core]++;
+ if(lastWall && wall-lastWall<200000){gFrameCostN++;gFrameCpuUs+=cpu-lastCpu;gFrameWallUs+=wall-lastWall;}
+ lastCpu=cpu;lastWall=wall;
+}
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
@@ -970,6 +988,7 @@ static void scheduled(void *context);
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
+ if(encodedWork.passes)noteFrameCost();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
@@ -1744,6 +1763,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("U n=%llu cpu=%llums wall=%llums c %llu %llu %llu %llu|%llu %llu %llu %llu",(unsigned long long)gFrameCostN.load(),
+  ms(gFrameCpuUs.load()),ms(gFrameWallUs.load()),(unsigned long long)gFrameCores[0].load(),
+  (unsigned long long)gFrameCores[1].load(),(unsigned long long)gFrameCores[2].load(),(unsigned long long)gFrameCores[3].load(),
+  (unsigned long long)gFrameCores[4].load(),(unsigned long long)gFrameCores[5].load(),(unsigned long long)gFrameCores[6].load(),
+  (unsigned long long)gFrameCores[7].load());
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
