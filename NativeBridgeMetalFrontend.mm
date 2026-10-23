@@ -12,6 +12,7 @@
 #import <objc/runtime.h>
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <pthread.h>
 #include <string>
@@ -84,8 +85,11 @@ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
 // the wall time since its previous such commit, and the core it committed from (TPIDR_EL0's CPU number; on SM6225 cores 0-3 are the
 // A53s, 4-7 the A73s). A gap past 200 ms is the compositor at rest and is not counted.
 static std::atomic<uint64_t> gFrameCostN,gFrameCpuUs,gFrameWallUs,gFrameCores[8];
+static void startProfile();
 static void noteFrameCost() {
  static thread_local uint64_t lastCpu,lastWall;
+ static std::atomic<uint32_t> renderCommits;
+ if(++renderCommits==200)startProfile();   // past the first frames: the thread committing now is the compositor's render thread
  uint64_t tpidr;__asm__ volatile("mrs %0, TPIDR_EL0":"=r"(tpidr));
  const unsigned core=(unsigned)(tpidr&0xfff);
  thread_basic_info_data_t t{};mach_msg_type_number_t n=THREAD_BASIC_INFO_COUNT;mach_port_t self=mach_thread_self();
@@ -144,6 +148,90 @@ static void journal(const std::string &line) {
  if(gJournalPath.empty())return;
  std::lock_guard<std::mutex> lock(gJournalLock);
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
+}
+
+// The render thread's CPU profile (U row: the compositor spends about 73 ms of CPU per frame). From the 200th commit with a render pass,
+// the committing thread is sampled about every millisecond: suspended, its registers read, its frame-pointer chain walked within its
+// stack (nothing is allocated while it is suspended: it may hold the allocator's lock), resumed. Identical stacks are counted together.
+// Once the thread has been idle for 5 s after new samples, profile.txt in the runtime's cache directory is rewritten (through a rename,
+// so the cache export never reads half a file): every address with its image, offset and dladdr's symbol, then each stack and its count.
+static std::string gProfilePath;
+static mach_port_t gProfiled;
+static uint64_t profileStrip(uint64_t address) {return address>>47?address&0x0000000FFFFFFFFFull:address;}
+static void writeProfile(const std::map<std::vector<uint64_t>,uint32_t> &stacks,uint64_t samples,uint64_t running,uint64_t since,
+                         std::unordered_map<uint64_t,std::string> &names) {
+ std::unordered_map<uint64_t,uint32_t> index;std::vector<uint64_t> addresses;
+ for(const auto &entry:stacks)for(uint64_t address:entry.first)if(index.emplace(address,(uint32_t)addresses.size()).second)addresses.push_back(address);
+ const std::string temporary=gProfilePath+".new";
+ FILE *f=fopen(temporary.c_str(),"w");
+ if(!f)return;
+ fprintf(f,"NBPROF1 samples=%llu running=%llu stacks=%zu addresses=%zu since=%llu\n",(unsigned long long)samples,(unsigned long long)running,
+         stacks.size(),addresses.size(),(unsigned long long)since);
+ for(size_t i=0;i<addresses.size();i++) {
+  const uint64_t address=addresses[i];
+  auto known=names.find(address);
+  if(known==names.end()) {
+   Dl_info info{};char text[256];
+   if(dladdr((const void *)address,&info) && info.dli_fname) {
+    const char *image=strrchr(info.dli_fname,'/');image=image?image+1:info.dli_fname;
+    snprintf(text,sizeof text,"%s+%llx %s",image,(unsigned long long)(address-(uint64_t)info.dli_fbase),info.dli_sname?info.dli_sname:"-");
+   } else snprintf(text,sizeof text,"? -");
+   known=names.emplace(address,text).first;
+  }
+  fprintf(f,"A %zu %llx %s\n",i,(unsigned long long)address,known->second.c_str());
+ }
+ for(const auto &entry:stacks) {
+  fprintf(f,"S %u",entry.second);
+  for(uint64_t address:entry.first)fprintf(f," %u",index[address]);
+  fputc('\n',f);
+ }
+ fclose(f);
+ rename(temporary.c_str(),gProfilePath.c_str());
+}
+static void *profileLoop(void *) {
+ pthread_setname_np("nb-profile");
+ const mach_port_t target=gProfiled;
+ uintptr_t stackHigh=0,stackLow=0;
+ if(pthread_t thread=pthread_from_mach_thread_np(target)) {
+  stackHigh=(uintptr_t)pthread_get_stackaddr_np(thread);stackLow=stackHigh-pthread_get_stacksize_np(thread);
+ }
+ std::map<std::vector<uint64_t>,uint32_t> stacks;std::unordered_map<uint64_t,std::string> names;
+ uint64_t samples=0,running=0,written=0,lastRunning=0;
+ const uint64_t since=nowUs();
+ for(;;) {
+  usleep(1000);
+  thread_basic_info_data_t info{};mach_msg_type_number_t n=THREAD_BASIC_INFO_COUNT;
+  if(thread_info(target,THREAD_BASIC_INFO,(thread_info_t)&info,&n)!=KERN_SUCCESS)break;   // the thread ended
+  samples++;
+  if(info.run_state==TH_STATE_RUNNING) {
+   uint64_t frames[20];unsigned depth=0;
+   if(thread_suspend(target)==KERN_SUCCESS) {
+    arm_thread_state64_t state{};mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
+    if(thread_get_state(target,ARM_THREAD_STATE64,(thread_state_t)&state,&count)==KERN_SUCCESS) {
+     frames[depth++]=profileStrip(arm_thread_state64_get_pc(state));
+     uintptr_t fp=(uintptr_t)arm_thread_state64_get_fp(state);
+     while(depth<20 && fp>=stackLow && fp+16<=stackHigh && !(fp&7)) {
+      const uintptr_t *record=(const uintptr_t *)fp;
+      const uint64_t ret=profileStrip(record[1]);
+      if(!ret)break;
+      frames[depth++]=ret;
+      if(record[0]<=fp)break;
+      fp=record[0];
+     }
+    }
+    thread_resume(target);
+   }
+   if(depth){running++;stacks[std::vector<uint64_t>(frames,frames+depth)]++;lastRunning=nowUs();}
+  }
+  if(running!=written && nowUs()-lastRunning>=5000000){writeProfile(stacks,samples,running,since,names);written=running;}
+ }
+ return nullptr;
+}
+static void startProfile() {
+ if(gProfilePath.empty())return;
+ gProfiled=mach_thread_self();   // the send right stays with the sampler
+ pthread_t thread;
+ if(pthread_create(&thread,nullptr,profileLoop,nullptr)==0)pthread_detach(thread);
 }
 
 @interface NBObject : NSObject
@@ -1593,7 +1681,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
- if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();gProfilePath=std::string(cache)+"/profile.txt";}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
