@@ -50,6 +50,17 @@ public:
         }
     }
     bool ready() const { return target_ != nil; }
+    // The scale kernel (shaders/scale_bgra.ll), for frames of another size than the scanout's: a board may render below the panel's size
+    // (NativeMobileDisplay's render size). Without it such a frame is refused, and the display driver copies it with the CPU.
+    // The kernel writes an ordinary buffer of the scanout's layout, which a blit then copies onto the scanout in one top-to-bottom run:
+    // written straight into the scanout, in the dispatch's 16x16 tiles, the scale took about 35 ms a frame of uncached stores and the
+    // panel showed a tear (tb128fu-084/085).
+    void setScaler(id<MTLComputePipelineState> scaler) {
+        scaler_ = scaler;
+        if (scaler_ && !scaled_) scaled_ = [device_ newBufferWithLength:scanout_.stride * scanout_.height options:MTLResourceStorageModePrivate];
+        if (!scaled_) scaler_ = nil;
+    }
+    bool scaling() const { return scaler_ != nil; }
     // Whether row y of the scanout lies in the overlay box (a read-back comparison skips it).
     bool overlayRow(uint32_t y) const { return overlay_ && y >= kOverlayY && y < kOverlayY + kOverlayHeight; }
     // A small opaque box near the top left of the panel, copied by the GPU over each frame right after the frame itself, so no CPU store
@@ -70,12 +81,14 @@ public:
         }
         sys_dcache_flush(pixels, kOverlayWidth * 4 * kOverlayHeight);
     }
-    // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
+    // One frame: encodes the GPU copy (or the scale onto the whole scanout), commits, waits for the GPU. Rows are copied as whole rows of
+    // width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+        const bool scaled = frame.width != scanout_.width || frame.height != scanout_.height;
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
-            frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
+            !frame.width || !frame.height || (scaled && (!scaler_ || (frame.stride & 3) || (scanout_.stride & 3))) || frame.stride < row ||
             (size_t)frame.height > frame.bytes / frame.stride || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
         // The compositor cycles through a few surfaces and the display driver keeps this task's mapping of each (frame.tag): the import of
         // a cached mapping is made once and reused, instead of pinning and mapping about 2400 pages into the GPU and back every frame.
@@ -98,9 +111,30 @@ public:
         }
         if (!source) return kNoResource;
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
-        id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
+        if (!commands) return kNoResource;
+        if (scaled) {
+            // One thread a scanout pixel: the bilinear mix of the four frame texels around it (the kernel's params, in its header).
+            id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
+            if (!compute) return kNoResource;
+            const uint32_t params[8] = {frame.width, frame.height, (uint32_t)(frame.stride / 4), scanout_.width, scanout_.height,
+                                        (uint32_t)(scanout_.stride / 4), (uint32_t)(((uint64_t)frame.width << 16) / scanout_.width),
+                                        (uint32_t)(((uint64_t)frame.height << 16) / scanout_.height)};
+            const NSUInteger side = scaler_.maxTotalThreadsPerThreadgroup >= 256 ? 16 : 8;
+            [compute setComputePipelineState:scaler_];
+            [compute setBuffer:source offset:0 atIndex:0];
+            [compute setBuffer:scaled_ offset:0 atIndex:1];
+            [compute setBytes:params length:sizeof params atIndex:2];
+            [compute dispatchThreadgroups:MTLSizeMake((scanout_.width + side - 1) / side, (scanout_.height + side - 1) / side, 1)
+                    threadsPerThreadgroup:MTLSizeMake(side, side, 1)];
+            [compute endEncoding];
+        }
+        // The copy of the frame (or of its scaled image) onto the scanout, and the overlay after it.
+        id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
         if (!blit) return kNoResource;
-        if (frame.stride == scanout_.stride) {
+        if (scaled) {
+            [blit copyFromBuffer:scaled_ sourceOffset:0 toBuffer:target_ destinationOffset:0
+                            size:scanout_.stride * (scanout_.height - 1) + (size_t)scanout_.width * 4];
+        } else if (frame.stride == scanout_.stride) {
             // Equal pitch: the rows are one contiguous run.
             [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:0 size:frame.stride * (frame.height - 1) + row];
         } else {
@@ -163,6 +197,8 @@ private:
     id<MTLBuffer> target_;
     id<MTLBuffer> overlayBuffer_;
     id<MTLTexture> overlay_;
+    id<MTLComputePipelineState> scaler_;
+    id<MTLBuffer> scaled_;   // the scaled frame, in the scanout's layout, before the blit onto the scanout
     struct Cached {uint32_t tag = 0; const void *base = nullptr; size_t bytes = 0; id<MTLBuffer> buffer;};
     Cached cached_[4];
 public:

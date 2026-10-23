@@ -11,10 +11,13 @@
 #include <stdio.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
+#include "ScaleKernelAir.h"
 #include "../NativeMobileDisplay/NativeGOPWire.h"
 
 // The render thread's frames and CPU time (NativeBridgeMetalFrontend.mm); absent where the native frontend is not linked (host checks).
 extern "C" void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us) __attribute__((weak_import));
+// A library from AIR bitcode, which only the native frontend loads (the scale kernel).
+extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
 
 namespace gpuscanout {
 
@@ -38,6 +41,8 @@ struct Stats {
     uint32_t lastMs;    // the GPU copy's time for the last frame
     uint64_t totalMs;   // and for all frames (the mean is totalMs / (frames + failures))
     uint64_t imported, reused;   // surface imports made, and frames that reused one (Presenter's cache of the driver's mappings)
+    int scaler;         // the scale kernel: 0 not loaded (no AIR loader), 1 ready, 2 library, 3 function, 4 pipeline refused
+    uint64_t scaled;    // frames scaled onto the scanout
 };
 
 class Client {
@@ -66,6 +71,16 @@ public:
         presenter_ = new gpupresent::Presenter(device, scanout);
         note(0x6715);
         if (!presenter_->ready()) return fail(3, 0);
+        // The scale kernel, for a board that renders below the panel's size: without it such frames take the display driver's CPU copy.
+        if (native_bridge_metal_library_with_air) {
+            id<MTLLibrary> library = native_bridge_metal_library_with_air(kScaleKernelAir, kScaleKernelAirLength);
+            id<MTLFunction> function = library ? [library newFunctionWithName:@"scale_bgra"] : nil;
+            NSError *error = nil;
+            id<MTLComputePipelineState> scaler = function ? [device newComputePipelineStateWithFunction:function error:&error] : nil;
+            presenter_->setScaler(scaler);
+            stats_->scaler = scaler ? 1 : !library ? 2 : !function ? 3 : 4;
+            note(scaler ? 0x6716 : 0x67f0 | (uint32_t)stats_->scaler);
+        }
         stats_->step = 4;
         return true;
     }
@@ -96,7 +111,10 @@ public:
             stats_->reused = presenter_->imports_[1];
         }
         stats_->lastResult = (int)r;
-        if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
+        const bool scaled = swap.width != scanout_.width || swap.height != scanout_.height;
+        if (r == gpupresent::kOk && scaled) ++stats_->scaled;
+        // The read-back compares rows one to one; a scaled frame has no such rows.
+        if (r == gpupresent::kOk && !scaled && stats_->verified < 4) verify(swap);
         if (r == gpupresent::kOk) updateOverlay();
         note(0x6731);   // the GPU copy returned
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
