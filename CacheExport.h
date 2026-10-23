@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <algorithm>
 #include <set>
 #include <string>
 #include <vector>
@@ -269,6 +270,9 @@ static void run(Gpu &marker, std::string root) {
         std::vector<File> files;
         scan(root, "", files, 0);
         dropBaked(files);
+        // The directory's own files (the journals, the profile, Turnip's trace) go before the shader cache's: the board's log reader
+        // copies the first 32 MiB of the export, and a larger one then keeps them whole (tb128fu-073 lost a trace behind the cache).
+        std::stable_partition(files.begin(), files.end(), [](const File &f) {return f.path.find('/') == std::string::npos;});
         const uint64_t now = signature(files);
         const bool stable = now == previous;
         previous = now;
