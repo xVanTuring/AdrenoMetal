@@ -8,9 +8,13 @@
 #import <Metal/Metal.h>
 #include <mach/mach_time.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
 #include "../NativeMobileDisplay/NativeGOPWire.h"
+
+// The render thread's frames and CPU time (NativeBridgeMetalFrontend.mm); absent where the native frontend is not linked (host checks).
+extern "C" void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us) __attribute__((weak_import));
 
 namespace gpuscanout {
 
@@ -93,6 +97,7 @@ public:
         }
         stats_->lastResult = (int)r;
         if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
+        if (r == gpupresent::kOk) updateOverlay();
         note(0x6731);   // the GPU copy returned
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
@@ -108,12 +113,37 @@ private:
         const volatile uint32_t *shown = (const volatile uint32_t *)scanout_.base;
         const volatile uint32_t *surface = (const volatile uint32_t *)(uintptr_t)swap.address;
         for (uint32_t y = 0; y < rows; ++y) {
+            if (presenter_->overlayRow(y)) continue;
             const volatile uint32_t *a = shown + (size_t)y * (scanout_.stride / 4), *b = surface + (size_t)y * (swap.stride / 4);
             for (uint32_t x = 0; x < words; ++x)
                 if (a[x] != b[x]) {++stats_->mismatchRows; break;}
         }
         ++stats_->verified;
     }
+    // The overlay's text, every half second of frames: the frames served in it per second and the render thread's CPU time per frame
+    // over the same span. A pause of a second or more starts a new span, so an idle screen does not count as a low rate.
+    void updateOverlay() {
+        static mach_timebase_info_data_t base;
+        if (!base.denom) mach_timebase_info(&base);
+        const uint64_t now = mach_absolute_time() * base.numer / base.denom / 1000;
+        uint64_t cost[2] = {};
+        if (native_bridge_metal_frame_cost) native_bridge_metal_frame_cost(&cost[0], &cost[1]);
+        if (!spanStart_ || now - lastFrame_ >= 1000000) {
+            spanStart_ = lastFrame_ = now; spanFrames_ = 0; spanCost_[0] = cost[0]; spanCost_[1] = cost[1];
+            return;
+        }
+        lastFrame_ = now;
+        ++spanFrames_;
+        if (now - spanStart_ < 500000) return;
+        char text[32];
+        const unsigned long long fps = (spanFrames_ * 1000000ull + (now - spanStart_) / 2) / (now - spanStart_);
+        const uint64_t frames = cost[0] - spanCost_[0];
+        if (frames) snprintf(text, sizeof text, "FPS %llu CPU %llums", fps, (unsigned long long)((cost[1] - spanCost_[1]) / frames / 1000));
+        else snprintf(text, sizeof text, "FPS %llu", fps);
+        presenter_->setOverlay(text);
+        spanStart_ = now; spanFrames_ = 0; spanCost_[0] = cost[0]; spanCost_[1] = cost[1];
+    }
+    uint64_t spanStart_ = 0, lastFrame_ = 0, spanFrames_ = 0, spanCost_[2] = {};
     void note(uint32_t value) {if (transport_.mark) transport_.mark(transport_.context, value);}
     bool fail(int step, int error) {stats_->step = step; stats_->error = error; return false;}
     Transport transport_ = {};

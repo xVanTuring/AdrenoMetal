@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <string.h>
 
+extern "C" void sys_dcache_flush(void *start, size_t length);
+
 namespace gpupresent {
 
 struct Scanout {
@@ -36,8 +38,38 @@ public:
         queue_ = [device newCommandQueue];
         if (!validScanout() || !queue_) return;
         target_ = [device newBufferWithBytesNoCopy:scanout.base length:scanout.bytes options:MTLResourceStorageModeShared deallocator:nil];
+        if (target_ && scanout.width >= kOverlayX + kOverlayWidth && scanout.height >= kOverlayY + kOverlayHeight &&
+            !(kOverlayWidth * 4 % [device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm])) {
+            overlayBuffer_ = [device newBufferWithLength:kOverlayWidth * 4 * kOverlayHeight options:MTLResourceStorageModeShared];
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:kOverlayWidth
+                                                                                       height:kOverlayHeight mipmapped:NO];
+            d.storageMode = MTLStorageModeShared;
+            d.usage = MTLTextureUsageShaderRead;
+            if (overlayBuffer_) overlay_ = [overlayBuffer_ newTextureWithDescriptor:d offset:0 bytesPerRow:kOverlayWidth * 4];
+            if (overlay_) setOverlay("FPS -");
+        }
     }
     bool ready() const { return target_ != nil; }
+    // Whether row y of the scanout lies in the overlay box (a read-back comparison skips it).
+    bool overlayRow(uint32_t y) const { return overlay_ && y >= kOverlayY && y < kOverlayY + kOverlayHeight; }
+    // A small opaque box near the top left of the panel, copied by the GPU over each frame right after the frame itself, so no CPU store
+    // meets the copy (the diagnostic overlay drawn into the scanout flickered against it): the text in a 5x7 font scaled by 3.
+    void setOverlay(const char *text) {
+        if (!overlay_) return;
+        uint32_t *pixels = (uint32_t *)[overlayBuffer_ contents];
+        for (uint32_t i = 0; i < kOverlayWidth * kOverlayHeight; ++i) pixels[i] = 0xff000000u;
+        uint32_t x = 6;
+        for (const char *c = text; *c && x + 15 <= kOverlayWidth; ++c, x += 18) {
+            const uint8_t *glyph = overlayGlyph(*c);
+            for (uint32_t row = 0; row < 7; ++row)
+                for (uint32_t column = 0; column < 5; ++column)
+                    if (glyph[row] & (0x10 >> column))
+                        for (uint32_t dy = 0; dy < 3; ++dy)
+                            for (uint32_t dx = 0; dx < 3; ++dx)
+                                pixels[(5 + row * 3 + dy) * kOverlayWidth + x + column * 3 + dx] = 0xff40ff40u;
+        }
+        sys_dcache_flush(pixels, kOverlayWidth * 4 * kOverlayHeight);
+    }
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
@@ -88,6 +120,11 @@ public:
                     destinationBytesPerRow:scanout_.stride destinationBytesPerImage:scanout_.stride * frame.height];
             }
         }
+        if (overlay_)
+            [blit copyFromTexture:overlay_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(kOverlayWidth, kOverlayHeight, 1) toBuffer:target_
+                destinationOffset:kOverlayY * scanout_.stride + kOverlayX * 4 destinationBytesPerRow:scanout_.stride
+                destinationBytesPerImage:scanout_.stride * kOverlayHeight];
         [blit endEncoding];
         [commands commit];
         [commands waitUntilCompleted];
@@ -100,10 +137,32 @@ private:
                scanout_.width && scanout_.height && scanout_.stride >= (size_t)scanout_.width * 4 &&
                scanout_.stride * scanout_.height <= scanout_.bytes;
     }
+    // Rows of 5 bits, the leftmost pixel in bit 4; anything without a glyph is a blank.
+    static const uint8_t *overlayGlyph(char c) {
+        static const uint8_t digits[10][7] = {
+            {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}, {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
+            {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, {0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e},
+            {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, {0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e},
+            {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e}, {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+            {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}, {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c}};
+        static const struct {char c; uint8_t rows[7];} letters[] = {
+            {'F', {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10}}, {'P', {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}},
+            {'S', {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}}, {'C', {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}},
+            {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}}, {'m', {0x00, 0x00, 0x1a, 0x15, 0x15, 0x11, 0x11}},
+            {'s', {0x00, 0x00, 0x0e, 0x10, 0x0e, 0x01, 0x1e}}, {'-', {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}},
+            {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c}}};
+        static const uint8_t blank[7] = {};
+        if (c >= '0' && c <= '9') return digits[c - '0'];
+        for (const auto &letter : letters) if (letter.c == c) return letter.rows;
+        return blank;
+    }
+    static constexpr uint32_t kOverlayWidth = 320, kOverlayHeight = 32, kOverlayX = 24, kOverlayY = 72;
     id<MTLDevice> device_;
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
+    id<MTLBuffer> overlayBuffer_;
+    id<MTLTexture> overlay_;
     struct Cached {uint32_t tag = 0; const void *base = nullptr; size_t bytes = 0; id<MTLBuffer> buffer;};
     Cached cached_[4];
 public:

@@ -1923,6 +1923,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  return at;
 }
 
+extern "C" void native_bridge_metal_frame_cost(uint64_t *frames,uint64_t *cpu_us) {
+ if(frames)*frames=gFrameCostN.load();
+ if(cpu_us)*cpu_us=gFrameCpuUs.load();
+}
+
 extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
  std::lock_guard<std::mutex> lock(gProblemLock);
  return native_bridge_metal_formats_locked(out,size);
