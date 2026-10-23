@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <pthread.h>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1537,6 +1538,17 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const size_t bytes=(allocation+page-1)&~(page-1);
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+ // Each kind of texture over a surface once in the journal ("T" lines): its size, format, usage and storage, the surface's pixel format,
+ // rows and allocation, and whether the runtime made it, so that its messages.log notices (a shadowed texture's copies) meet their surface.
+ {
+  char line[256];
+  snprintf(line,sizeof line,"T surface %lux%lu fmt=%lu usage=0x%lx storage=%lu fourcc=0x%08x planes=%zu plane=%lu offset=%zu row=%zu alloc=%zu made=%d",
+   (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)d.usage,(unsigned long)d.storageMode,
+   (unsigned)IOSurfaceGetPixelFormat(surface),planes,(unsigned long)plane,(size_t)(start-(uintptr_t)base),row,allocation,texture?1:0);
+  static std::mutex seenLock;static std::set<std::string> seen;
+  bool fresh;{std::lock_guard<std::mutex> lock(seenLock);fresh=seen.size()<500 && seen.insert(line).second;}
+  if(fresh)journal(line);
+ }
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
@@ -1713,6 +1725,10 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
+ // Turnip's printed GPU trace (the plugin's NativeTurnipTrace) goes beside the journal, which the board exports; without it an earlier
+ // boot's trace is removed (the cache directory persists, and 14 MiB of it overflowed the reader's 32 MiB export copy).
+ if(cache && getenv("NMB_GPU_TRACE"))setenv("MESA_GPU_TRACEFILE",(std::string(cache)+"/gputrace.txt").c_str(),1);
+ else if(cache)unlink((std::string(cache)+"/gputrace.txt").c_str());
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();gProfilePath=std::string(cache)+"/profile.txt";}

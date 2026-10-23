@@ -163,6 +163,9 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
         options.metal_level = Some(MetalLevel::NEWEST);
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
+        if let Ok(mut log) = MESSAGE_LOG.lock() {
+            *log = Some((PathBuf::from(cache.to_string_lossy().into_owned()).join("messages.log"), Default::default()));
+        }
         options.messages = Some(MessageSink::new(observe_message));
         Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
     })
@@ -174,6 +177,27 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
 static PIPELINE_MAKINGS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5]; // n, us, max us, waited us, failed
 static OTHER_MESSAGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];      // info, warning or worse
 static LAST_WARNING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+// Every distinct message but the pipeline makings, appended to messages.log in the shader cache's directory, which the board exports:
+// the runtime announces each degradation once, with why (a texture over a surface shadowed, for one), which the last warning alone
+// did not keep. At most 2000 lines.
+type MessageLog = Option<(PathBuf, std::collections::HashSet<String>)>;
+static MESSAGE_LOG: std::sync::Mutex<MessageLog> = std::sync::Mutex::new(None);
+
+fn log_message(message: &DebugMessage) {
+    let Ok(mut log) = MESSAGE_LOG.lock() else { return };
+    let Some((path, seen)) = log.as_mut() else { return };
+    let line: String = format!("{:?} {:?} {} {}", message.severity, message.kind, message.id_name, message.text.replace('\n', " | "))
+        .chars()
+        .take(2000)
+        .collect();
+    if seen.len() >= 2000 || !seen.insert(line.clone()) {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
 
 fn millis_after(text: &str, marker: &str) -> Option<f64> {
     let at = text.find(marker)? + marker.len();
@@ -196,6 +220,7 @@ fn observe_message(message: &DebugMessage) {
         }
         return;
     }
+    log_message(message);
     if message.severity >= MessageSeverity::Warning {
         OTHER_MESSAGES[1].fetch_add(1, Relaxed);
         if let Ok(mut last) = LAST_WARNING.lock() {

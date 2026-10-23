@@ -205,6 +205,19 @@ static void applyBoardTurnipDebug(unsigned port) {
     void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
     auto copyProperty = iokit ? (CFTypeRef (*)(unsigned, CFStringRef, CFAllocatorRef, uint32_t))dlsym(iokit, "IORegistryEntryCreateCFProperty")
                               : nullptr;
+    // NativeTurnipTrace: Turnip's GPU trace points to print in the render server (TU_GPU_TRACEPOINT, e.g. "-all,+render_pass"), each
+    // with its GPU time; the frontend points MESA_GPU_TRACEFILE into the runtime's cache directory, which the board exports.
+    CFTypeRef trace = copyProperty && strcmp(getprogname(), "backboardd") == 0
+                          ? copyProperty(port, CFSTR("NativeTurnipTrace"), kCFAllocatorDefault, 0) : nullptr;
+    if (trace) {
+        char points[256];
+        if (CFGetTypeID(trace) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) trace, points, sizeof points, kCFStringEncodingUTF8)) {
+            setenv("TU_GPU_TRACEPOINT", points, 1);
+            setenv("MESA_GPU_TRACES", "print", 1);
+            setenv("NMB_GPU_TRACE", "1", 1);
+        }
+        CFRelease(trace);
+    }
     CFTypeRef value = copyProperty ? copyProperty(port, CFSTR("NativeTurnipDebug"), kCFAllocatorDefault, 0) : nullptr;
     if (!value) return;
     char text[128];
