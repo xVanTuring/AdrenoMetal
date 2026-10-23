@@ -1649,9 +1649,24 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
+// Answers with an argument (supportsFamily:, a pixel format's alignments, ...) are the device's fixed properties too, but each call asked
+// the runtime again, and the runtime audits every family table for a family question: Metal asks supportsFamily: for each texture
+// level's info it computes, which was about 30% of the render thread's CPU on the TB128FU (profile of round 054). The first answer for a
+// selector and argument is kept; so is a refusal (0), which is logged once.
+static std::mutex gArgAnswerLock;
+static std::unordered_map<SEL,std::unordered_map<NSUInteger,uint64_t>> gArgAnswers;
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ {
+  std::lock_guard<std::mutex> lock(gArgAnswerLock);
+  auto known=gArgAnswers.find(cmd);
+  if(known!=gArgAnswers.end()){auto value=known->second.find(arg);if(value!=known->second.end())return value->second;}
+ }
  uint64_t value=0;
- if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());return 0;}
+ if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){
+  NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;
+ }
+ std::lock_guard<std::mutex> lock(gArgAnswerLock);
+ gArgAnswers[cmd][arg]=value;
  return value;
 }
 static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
