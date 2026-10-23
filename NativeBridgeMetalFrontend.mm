@@ -102,7 +102,10 @@ static void noteFrameCost() {
  if(lastWall && wall-lastWall<200000){gFrameCostN++;gFrameCpuUs+=cpu-lastCpu;gFrameWallUs+=wall-lastWall;}
  lastCpu=cpu;lastWall=wall;
 }
-struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0,gpuUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
+// The GPU's own time on command buffers (the runtime's gpuStartTime/gpuEndTime: its timestamp queries), all of them and those with a render
+// pass, against the commit-to-completion time that also holds the queue's wait (round 067: 80-130 ms per compositor command buffer).
+static std::atomic<uint64_t> gGpuTimed,gGpuUs,gGpuPassUs,gGpuUntimed;
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
 static std::mutex gProblemLock;
@@ -1139,9 +1142,12 @@ static void completed(void *context) {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
   uint64_t seen=gTimeEncodeToCommit.slowest.load();while(took>seen && !gTimeEncodeToCommit.slowest.compare_exchange_weak(seen,took)){}
+  const double gpuStart=nmb_command_buffer_gpu_time(commandBuffer.handle,false),gpuEnd=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
+  const uint64_t gpu=(gpuEnd>gpuStart && gpuStart>0)?(uint64_t)((gpuEnd-gpuStart)*1e6):0;
+  if(gpu){gGpuTimed++;gGpuUs+=gpu;if(commandBuffer->encodedWork.passes)gGpuPassUs+=gpu;}else gGpuUntimed++;
   std::lock_guard<std::mutex> lock(gCommitLock);
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
-  if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
+  if(r.index==commandBuffer.commitIndex){r.callbackUs=took;r.gpuUs=gpu;}
  }
  [commandBuffer finish];
 }
@@ -1879,6 +1885,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("V gpu timed %llu untimed %llu total=%llums passes=%llums",(unsigned long long)gGpuTimed.load(),(unsigned long long)gGpuUntimed.load(),
+  ms(gGpuUs.load()),ms(gGpuPassUs.load()));
  row("U n=%llu cpu=%llums wall=%llums c %llu %llu %llu %llu|%llu %llu %llu %llu",(unsigned long long)gFrameCostN.load(),
   ms(gFrameCpuUs.load()),ms(gFrameWallUs.load()),(unsigned long long)gFrameCores[0].load(),
   (unsigned long long)gFrameCores[1].load(),(unsigned long long)gFrameCores[2].load(),(unsigned long long)gFrameCores[3].load(),
@@ -1915,8 +1923,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   for(uint32_t k=0;k<20 && k<newest;k++) {
    const CommitRecord &r=gCommitRing[(newest-k)%32];
    if(r.index!=newest-k)continue;
-   row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus",r.index,(unsigned long long)(r.committedUs/1000000),(unsigned long long)((r.committedUs/1000)%1000),
-    r.work.passes,r.work.draws,(unsigned long long)(r.work.pixels>>10),r.work.dispatches,r.work.blits,(unsigned long long)r.callbackUs);
+   row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus gpu=%lluus",r.index,(unsigned long long)(r.committedUs/1000000),
+    (unsigned long long)((r.committedUs/1000)%1000),r.work.passes,r.work.draws,(unsigned long long)(r.work.pixels>>10),r.work.dispatches,r.work.blits,
+    (unsigned long long)r.callbackUs,(unsigned long long)r.gpuUs);
    if(k<4)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
   }
  }
