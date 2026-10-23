@@ -218,6 +218,13 @@ static void applyBoardTurnipDebug(unsigned port) {
         }
         CFRelease(trace);
     }
+    // NativeMetalWithhold: device capabilities the frontend withholds in every process ("programmable-blending"), as NMB_WITHHOLD.
+    if (CFTypeRef withhold = copyProperty ? copyProperty(port, CFSTR("NativeMetalWithhold"), kCFAllocatorDefault, 0) : nullptr) {
+        char what[128];
+        if (CFGetTypeID(withhold) == CFStringGetTypeID() && CFStringGetCString((CFStringRef) withhold, what, sizeof what, kCFStringEncodingUTF8))
+            setenv("NMB_WITHHOLD", what, 1);
+        CFRelease(withhold);
+    }
     CFTypeRef value = copyProperty ? copyProperty(port, CFSTR("NativeTurnipDebug"), kCFAllocatorDefault, 0) : nullptr;
     if (!value) return;
     char text[128];

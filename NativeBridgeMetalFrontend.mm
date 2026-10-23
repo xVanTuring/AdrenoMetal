@@ -153,6 +153,12 @@ static void journal(const std::string &line) {
  std::lock_guard<std::mutex> lock(gJournalLock);
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
+// The draw census (censusDraw), on where Turnip's trace is (NMB_GPU_TRACE).
+static bool gDrawCensus;
+static std::mutex gCensusLock;
+static std::unordered_map<std::string,uint64_t> gCensus;
+static uint64_t gCensusDraws;
+static std::string gCensusPath;
 
 // The render thread's CPU profile (U row: the compositor spends about 73 ms of CPU per frame). From the 200th commit with a render pass,
 // the committing thread is sampled about every millisecond: suspended, its registers read, its frame-pointer chain walked within its
@@ -595,6 +601,7 @@ static std::string quartzCoreCallers();
 @end
 @interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
+@property(nonatomic,copy) NSString *censusName;   // label and fragment function, for the draw census (gDrawCensus)
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -782,11 +789,34 @@ static void waitForResource(id resource) {
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
-@interface NBRenderEncoder : NBEncoder
+@interface NBRenderEncoder : NBEncoder {
+@public
+ NSString *censusPipeline,*censusTexture;   // the draw census's pipeline and fragment texture 0 (gDrawCensus)
+}
 @end
+// The draw census (with Turnip's trace, NativeTurnipTrace): draws counted by pipeline, vertex count and fragment texture 0, written to
+// draws.txt beside the journal every 2000 draws, so that the trace's per-shader draw counts name their pipelines and textures.
+static void censusDraw(NBRenderEncoder *encoder,NSUInteger vertices,NSUInteger instances) {
+ std::string key=std::string((encoder->censusPipeline?:@"?").UTF8String)+" | v"+std::to_string(vertices)+(instances>1?"x"+std::to_string(instances):"")+
+  " | t0 "+(encoder->censusTexture?:@"-").UTF8String;
+ std::lock_guard<std::mutex> lock(gCensusLock);
+ ++gCensus[key];
+ if(++gCensusDraws%2000 || gCensusPath.empty())return;
+ const std::string temporary=gCensusPath+".tmp";
+ if(FILE *f=fopen(temporary.c_str(),"w")){
+  for(const auto &[line,count]:gCensus)fprintf(f,"%llu %s\n",(unsigned long long)count,line.c_str());
+  fclose(f);rename(temporary.c_str(),gCensusPath.c_str());
+ }
+}
+static NSString *describeCensusTexture(id<MTLTexture> t) {
+ if(![(id)t isKindOfClass:[NBTexture class]])return t?@"other":@"-";
+ NBTexture *texture=(NBTexture *)t;const NmbTextureDescriptor d=texture.descriptor;
+ return [NSString stringWithFormat:@"%llux%llu f%llu L%llu%s",d.width,d.height,d.format,d.levels,texture.surface?" surface":texture.buffer?" buffer":""];
+}
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+ if(gDrawCensus)censusPipeline=[(NBRenderPipeline *)state censusName];
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -802,9 +832,12 @@ static void waitForResource(id resource) {
 - (void)setVertexBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:1];}
 - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:2];}
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:2];}
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
+ if(gDrawCensus && i==0)censusTexture=describeCensusTexture(t);
+ [self texture:t index:i stage:2];
+}
 - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
- for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:2];
+ for(NSUInteger k=0;k<r.length;k++)[self setFragmentTexture:t[k] atIndex:r.location+k];
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
@@ -836,7 +869,7 @@ static void waitForResource(id resource) {
  [self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
- [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
+ [self setFragmentTexture:t atIndex:ti];[self sampler:s index:si stage:2];
 }
 // Tile shaders and imageblock tile memory (Apple GPU families 4 and up) are not offered: supportsTileShaders answers no, and a call that
 // reaches one anyway fails its command buffer.
@@ -855,6 +888,7 @@ static void waitForResource(id resource) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(gDrawCensus)censusDraw(self,n,i);
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
@@ -868,6 +902,7 @@ static void waitForResource(id resource) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(gDrawCensus)censusDraw(self,n,i);
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
@@ -1617,7 +1652,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ if(gDrawCensus)state.censusName=[NSString stringWithFormat:@"%@ | %@",d.label?:@"-",d.fragmentFunction.name?:@"-"];
+ return (id<MTLRenderPipelineState>)state;
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
 // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
@@ -1696,6 +1733,14 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
  if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){
   NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;
  }
+ // A board may withhold the Apple1 family (NativeMetalWithhold "apple1-family"): Core Animation's Metal context sets the feature bits it
+ // blends by framebuffer fetch with from supportsFamily:MTLGPUFamilyApple1 alone (QuartzCore 0x189562720 in iPadOS 17.7.11), whatever
+ // the later families answer.
+ // That alone changed nothing (tb128fu-081); "apple-families" withholds every Apple family (1001-1999), leaving the common ones.
+ static const SEL family=sel_registerName("supportsFamily:");
+ static const bool withholdApple1=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple1-family");}();
+ static const bool withholdApple=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple-families");}();
+ if(cmd==family && ((withholdApple1 && arg==1001) || (withholdApple && arg>=1001 && arg<2000)))value=0;
  std::lock_guard<std::mutex> lock(gArgAnswerLock);
  gArgAnswers[cmd][arg]=value;
  return value;
@@ -1727,8 +1772,12 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gMissing=missing;gInFlight=[NSMutableSet set];
  // Turnip's printed GPU trace (the plugin's NativeTurnipTrace) goes beside the journal, which the board exports; without it an earlier
  // boot's trace is removed (the cache directory persists, and 14 MiB of it overflowed the reader's 32 MiB export copy).
- if(cache && getenv("NMB_GPU_TRACE"))setenv("MESA_GPU_TRACEFILE",(std::string(cache)+"/gputrace.txt").c_str(),1);
- else if(cache)unlink((std::string(cache)+"/gputrace.txt").c_str());
+ if(cache && getenv("NMB_GPU_TRACE")){
+  setenv("MESA_GPU_TRACEFILE",(std::string(cache)+"/gputrace.txt").c_str(),1);
+  gDrawCensus=true;gCensusPath=std::string(cache)+"/draws.txt";
+ } else if(cache){
+  unlink((std::string(cache)+"/gputrace.txt").c_str());unlink((std::string(cache)+"/draws.txt").c_str());
+ }
  gDevice=nmb_device_open(loader,cache);
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();gProfilePath=std::string(cache)+"/profile.txt";}
@@ -1751,6 +1800,15 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  unsigned count=0;Method *methods=class_copyMethodList([NBDeviceMethods class],&count);
  for(unsigned i=0;i<count;i++)class_addMethod(cls,method_getName(methods[i]),method_getImplementation(methods[i]),method_getTypeEncoding(methods[i]));
  free(methods);installAnswers(cls);class_addProtocol(cls,@protocol(MTLDevice));
+ // A board may withhold programmable blending (the plugin's NativeMetalWithhold, "programmable-blending"): Core Animation blends every
+ // layer in its fragment function through framebuffer fetch where a device offers it (all 1914 of its pipelines in tb128fu-079), and on
+ // the Adreno 610 each such draw reads its target back in rasterization order (a full-screen fill took 6 to 21 ms of GPU time). Metal's
+ // own answers come from the GPU family, which this device claims. Core Animation does not ask them (tb128fu-080 changed nothing).
+ if(const char *withheld=getenv("NMB_WITHHOLD"); withheld && strstr(withheld,"programmable-blending")) {
+  IMP no=imp_implementationWithBlock(^BOOL(id) {return NO;});
+  for(const char *name:{"supportsProgrammableBlending","supportsFramebufferFetch","_familySupportsProgrammableBlending"})
+   class_replaceMethod(cls,sel_registerName(name),no,"B16@0:8");
+ }
  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
