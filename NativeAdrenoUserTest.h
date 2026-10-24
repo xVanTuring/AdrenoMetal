@@ -41,6 +41,7 @@ struct Gpu {
     uint32_t selector = 0;
     unsigned admitted = 0;
     uint64_t lastTicks = 0;
+    uint32_t chipId = 0;   // the driver's device info, read by runTest
     unsigned port = 0;
     IOServiceOpenFn openFn = nullptr;
     IOServiceCloseFn closeFn = nullptr;
@@ -125,6 +126,7 @@ int runTest(Gpu &gpu, uint32_t mapFlags, int &step, int &error) {
     if (!check(gpu.method(NativeAdrenoMethodQuery, nullptr, 0, &params, sizeof params))) return -1;
     NativeAdrenoAbiDeviceInfo info = {};
     if (!check(gpu.method(NativeAdrenoMethodGetDeviceInfo, nullptr, 0, &info, sizeof info))) return -1;
+    gpu.chipId = info.chip_id;
     NativeAdrenoAbiBoAlloc alloc = {4096, 12, 0};
     NativeAdrenoAbiBoAllocReply ib = {}, target = {};
     if (!check(gpu.method(NativeAdrenoMethodBoAlloc, &alloc, sizeof alloc, &ib, sizeof ib)) ||
@@ -563,8 +565,10 @@ static void turnipPhase(Gpu &gpu) {
     auto marker = [&](uint32_t value) { gpu.mark(value); };
     const turnip::Result result = turnip::runWatched(marker, [&](const char *text) { streamText(gpu, text); }, path);
     char text[NativeAdrenoAbiMetadataBytes] = {};
-    snprintf(text, sizeof text, "T s%d r%d v%d c%d%s g%d/%d%s %.30s", result.stage, result.vkResult, result.verified, result.computeWords,
-             result.computeStage ? "!" : "", result.renderTriangle, result.renderOther, result.renderStage ? "!" : "", turnip::gFirstError);
+    // The words a failed check left: the compute buffer's first word and its untouched words, the render read-back's first pixel.
+    snprintf(text, sizeof text, "T s%d r%d v%d c%d%s g%d/%d%s w%x u%u p%x %.12s", result.stage, result.vkResult, result.verified,
+             result.computeWords, result.computeStage ? "!" : "", result.renderTriangle, result.renderOther, result.renderStage ? "!" : "",
+             turnip::gComputeFirst, turnip::gComputeUntouched, turnip::gRenderFirst, turnip::gFirstError);
     streamText(gpu, text);
     gpu.mark(result.ok ? 0x6fff : 0x6ffe);
     // Also when results are wrong but every Vulkan step ran: one boot then shows both layers.
@@ -614,14 +618,18 @@ static int adrenoUserTest(unsigned port, const char *process) {
     bool replayed = true;
 #ifdef NATIVE_TURNIP_REPLAY
     // Plugin only (the Turnip library sits next to it): a stuck replay leaves the CP stopped, so Turnip is not started after it.
+    // The replay is the host simulation's recording, made for the Adreno 740 (gen-turnip-replay.py, chip 0x43050a01); on another GPU
+    // its packets mean something else (the Adreno 650 retired none of its prefixes), so the Turnip phase follows without it.
+    const bool replayable = gpu.chipId == 0x43050a01u;
     char turnipPath[1024];
-    if (verified == 4 && verifiedWc == 4 && turnip::libraryPath(turnipPath, sizeof turnipPath) && access(turnipPath, R_OK) == 0) {
+    if (replayable && verified == 4 && verifiedWc == 4 && turnip::libraryPath(turnipPath, sizeof turnipPath) &&
+        access(turnipPath, R_OK) == 0) {
         replayed = freshScan(gpu) && replayPhase(gpu);
     }
 #endif
     close(gpu.conn);
 #ifdef NATIVE_TURNIP_REPLAY
-    if (replayed && verified == 4 && verifiedWc == 4) replayed = replaySecondClient(gpu);
+    if (replayable && replayed && verified == 4 && verifiedWc == 4) replayed = replaySecondClient(gpu);
 #endif
     if (verified == 4 && verifiedWc == 4 && replayed) turnipPhase(gpu);
     return verified;

@@ -29,6 +29,9 @@
 namespace turnip {
 
 static char gFirstError[96];
+// What a failing check left behind (the report's "w", "u" and "p"): the compute buffer's first word and how many words kept the
+// 0xdeadbeef fill (all of them: the shader wrote nothing), and the render read-back's first pixel (0x5a5a5a5a: not even copied).
+static uint32_t gComputeFirst, gComputeUntouched, gRenderFirst;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL onMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
                                                 const VkDebugUtilsMessengerCallbackDataEXT *data, void *) {
@@ -240,6 +243,9 @@ static int computeTest(Device &d, Marker &mark, int &stage) {
         mark(0x6103);
         int good = 0;
         for (uint32_t i = 0; i < kWords; ++i) good += b.words[i] == i * kMul + kAdd;
+        gComputeFirst = b.words[0];
+        gComputeUntouched = 0;
+        for (uint32_t i = 0; i < kWords; ++i) gComputeUntouched += b.words[i] == 0xdeadbeef;
         result = good;
         if (good == int(kWords)) mark(0x6104);
     } while (false);
@@ -404,6 +410,7 @@ static void renderTest(Device &d, Marker &mark, int &stage, int &triangle, int &
         }
         triangle = tri;
         other = rest;
+        gRenderFirst = b.words[0];
         if (rest == 0 && tri >= 480 && tri <= 544) mark(0x6204);
     } while (false);
     if (pipeline) d.vkDestroyPipeline(d.device, pipeline, nullptr);
