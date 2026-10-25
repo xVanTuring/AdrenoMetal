@@ -5,6 +5,7 @@
 // here. Used through the public Metal API, on any device (the native frontend on the tablet, the Mac's device for the host check).
 #pragma once
 #import <Metal/Metal.h>
+#include <mach/mach_time.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
@@ -12,6 +13,23 @@
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
 namespace gpupresent {
+
+// What a present costs, in nanoseconds, by step, and which copy form each frame took: 0 the frame's rows and the scanout's run together (one
+// buffer copy), 1 the frame as a linear texture over its pages (one buffer-image copy, or a buffer copy per row where that texture has no image
+// of its own), 2 row by row from here. Reported through native_bridge_metal_present_cost (NativeBridgeMetalFrontend.h, its A4 row).
+struct Cost {
+    uint64_t frames = 0;
+    uint64_t importNs = 0, textureNs = 0, encodeNs = 0, submitNs = 0, waitNs = 0;
+    uint64_t forms[3] = {};
+    uint64_t texturesMade = 0, texturesReused = 0;
+    // The last frame's width, height and stride, then the scanout's (its A4 row): the two pitches decide the copy's form.
+    uint64_t geometry[6] = {};
+};
+static inline uint64_t nowNs() {
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    return mach_absolute_time() * base.numer / base.denom;
+}
 
 struct Scanout {
     void *base;       // writable mapping of the firmware framebuffer (page aligned)
@@ -85,6 +103,7 @@ public:
     // width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
+        const uint64_t began = nowNs();
         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
         const bool scaled = frame.width != scanout_.width || frame.height != scanout_.height;
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
@@ -93,16 +112,17 @@ public:
         // The compositor cycles through a few surfaces and the display driver keeps this task's mapping of each (frame.tag): the import of
         // a cached mapping is made once and reused, instead of pinning and mapping about 2400 pages into the GPU and back every frame.
         id<MTLBuffer> source = nil;
-        if (frame.tag & 0x80) {
-            Cached &cached = cached_[frame.tag & 3];
-            if (cached.buffer && cached.tag == frame.tag && cached.base == frame.base && cached.bytes == frame.bytes) {
-                source = cached.buffer;
+        Cached *cached = (frame.tag & 0x80) ? &cached_[frame.tag & 3] : nullptr;
+        if (cached) {
+            if (cached->buffer && cached->tag == frame.tag && cached->base == frame.base && cached->bytes == frame.bytes) {
+                source = cached->buffer;
                 ++imports_[1];
             } else {
-                cached.buffer = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared
+                cached->buffer = [device_ newBufferWithBytesNoCopy:(void *)frame.base length:frame.bytes options:MTLResourceStorageModeShared
                                                        deallocator:nil];
-                cached.tag = frame.tag; cached.base = frame.base; cached.bytes = frame.bytes;
-                source = cached.buffer;
+                cached->tag = frame.tag; cached->base = frame.base; cached->bytes = frame.bytes;
+                cached->texture = nil;   // another mapping: its texture is not this one's
+                source = cached->buffer;
                 ++imports_[0];
             }
         } else {
@@ -128,9 +148,15 @@ public:
                     threadsPerThreadgroup:MTLSizeMake(side, side, 1)];
             [compute endEncoding];
         }
+        cost_.geometry[0] = frame.width; cost_.geometry[1] = frame.height; cost_.geometry[2] = frame.stride;
+        cost_.geometry[3] = scanout_.width; cost_.geometry[4] = scanout_.height; cost_.geometry[5] = scanout_.stride;
+        // What the frame's import, its texture and the copy's encoding cost (cost), and which form the copy takes.
+        uint64_t step = nowNs();
+        cost_.importNs += step - began;
         // The copy of the frame (or of its scaled image) onto the scanout, and the overlay after it.
         id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
         if (!blit) return kNoResource;
+        uint32_t form = 0;
         if (scaled) {
             [blit copyFromBuffer:scaled_ sourceOffset:0 toBuffer:target_ destinationOffset:0
                             size:scanout_.stride * (scanout_.height - 1) + (size_t)scanout_.width * 4];
@@ -138,17 +164,38 @@ public:
             // Equal pitch: the rows are one contiguous run.
             [blit copyFromBuffer:source sourceOffset:0 toBuffer:target_ destinationOffset:0 size:frame.stride * (frame.height - 1) + row];
         } else {
-            // A linear texture over the surface pages reads them with the surface's pitch and writes the scanout's pitch.
-            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:frame.width
-                                                                                       height:frame.height mipmapped:NO];
-            d.storageMode = MTLStorageModeShared;
-            d.usage = MTLTextureUsageShaderRead;
+            // A linear texture over the surface pages reads them with the surface's pitch and writes the scanout's pitch: one buffer-image
+            // copy where the runtime's image is that buffer's own bytes, else one buffer copy per row. The texture is the mapping's, made at
+            // its first frame and kept while the mapping is (a new one a frame was an image made and thrown away a frame).
+            form = 1;
             if (frame.stride % [device_ minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm]) {
+                form = 2;
                 for (uint32_t y = 0; y < frame.height; ++y)
                     [blit copyFromBuffer:source sourceOffset:y * frame.stride toBuffer:target_ destinationOffset:y * scanout_.stride size:row];
             } else {
-                id<MTLTexture> texture = [source newTextureWithDescriptor:d offset:0 bytesPerRow:frame.stride];
+                id<MTLTexture> texture = nil;
+                const uint64_t textureBegan = nowNs();
+                if (cached && cached->texture && cached->stride == frame.stride && cached->width == frame.width &&
+                    cached->height == frame.height) {
+                    texture = cached->texture;
+                    ++cost_.texturesReused;
+                } else {
+                    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:frame.width
+                                                                                               height:frame.height mipmapped:NO];
+                    d.storageMode = MTLStorageModeShared;
+                    d.usage = MTLTextureUsageShaderRead;
+                    texture = [source newTextureWithDescriptor:d offset:0 bytesPerRow:frame.stride];
+                    ++cost_.texturesMade;
+                    if (texture && cached) {
+                        cached->texture = texture; cached->stride = frame.stride; cached->width = frame.width; cached->height = frame.height;
+                    }
+                }
                 if (!texture) {[blit endEncoding]; return kNoResource;}
+                {
+                    const uint64_t acquired = nowNs();
+                    cost_.textureNs += acquired - textureBegan;
+                    step = acquired;
+                }
                 [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                            sourceSize:MTLSizeMake(frame.width, frame.height, 1) toBuffer:target_ destinationOffset:0
                     destinationBytesPerRow:scanout_.stride destinationBytesPerImage:scanout_.stride * frame.height];
@@ -160,10 +207,25 @@ public:
                 destinationOffset:kOverlayY * scanout_.stride + kOverlayX * 4 destinationBytesPerRow:scanout_.stride
                 destinationBytesPerImage:scanout_.stride * kOverlayHeight];
         [blit endEncoding];
+        {
+            const uint64_t encoded = nowNs();
+            cost_.encodeNs += encoded - step;
+            step = encoded;
+        }
         [commands commit];
+        {
+            const uint64_t submitted = nowNs();
+            cost_.submitNs += submitted - step;
+            step = submitted;
+        }
         [commands waitUntilCompleted];
+        cost_.waitNs += nowNs() - step;
+        ++cost_.frames;
+        ++cost_.forms[form < 3 ? form : 0];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
+    // The cost so far, and the copy forms taken (Cost).
+    const Cost &cost() const {return cost_;}
 private:
     bool validScanout() const {
         const size_t page = (size_t)getpagesize();
@@ -199,7 +261,9 @@ private:
     id<MTLTexture> overlay_;
     id<MTLComputePipelineState> scaler_;
     id<MTLBuffer> scaled_;   // the scaled frame, in the scanout's layout, before the blit onto the scanout
-    struct Cached {uint32_t tag = 0; const void *base = nullptr; size_t bytes = 0; id<MTLBuffer> buffer;};
+    struct Cached {uint32_t tag = 0; const void *base = nullptr; size_t bytes = 0; size_t stride = 0; uint32_t width = 0, height = 0;
+                   id<MTLBuffer> buffer; id<MTLTexture> texture;};
+    Cost cost_;
     Cached cached_[4];
 public:
     uint64_t imports_[2] = {};   // surfaces imported, frames that reused an import

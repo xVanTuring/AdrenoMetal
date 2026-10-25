@@ -255,6 +255,42 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
     })
 }
 
+/// The runtime's copy census and its buffer-texture census, for the device's telemetry: the copies out of a texture, those of each path,
+/// their regions and the last rows copy's row count (7), then the buffer textures whose image aliased its bytes, those whose did not, and
+/// the last one's layout row pitch, driver row pitch and alignment (5). Diagnostic only.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_copy_census(out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null census".into());
+        }
+        let copies = metal2vulkan_runtime::copy_census();
+        let textures = metal2vulkan_runtime::buffer_texture_census();
+        // SAFETY: the header's twelve words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 12) };
+        out[..7].copy_from_slice(&copies);
+        out[7..].copy_from_slice(&textures);
+        Ok(true)
+    })
+}
+
+/// The runtime's encoder phases, for the device's telemetry: the nanoseconds of a draw's steps (bind state, command, heaps, record), a
+/// pass's close (its end, its shadow copies, its bookkeeping) and a commit's (state, host steps, planning, submit), then the draws, closes
+/// and commits counted — fourteen words. Diagnostic only.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_phase_timings(out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null timings".into());
+        }
+        let timings = metal2vulkan_runtime::phase_timings();
+        // SAFETY: the header's fourteen words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 14) };
+        out.copy_from_slice(&timings);
+        Ok(true)
+    })
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {

@@ -39,6 +39,12 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+/* The runtime's copy census (texture copies, by path, their regions) and its buffer-texture census (aliased images, the row pitches):
+ * twelve words, diagnostic. */
+bool nmb_copy_census(uint64_t out[12]);
+/* The runtime's encoder phases in nanoseconds (a draw's four steps, a close's three, a commit's four) and their counts: fourteen words,
+ * diagnostic. */
+bool nmb_phase_timings(uint64_t out[14]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;

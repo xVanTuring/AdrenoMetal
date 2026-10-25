@@ -18,6 +18,11 @@ size_t native_bridge_metal_formats(char *out, size_t size);
 size_t native_bridge_metal_telemetry(char *out, size_t size);
 // The render thread's frames so far (commits with a render pass, the U row) and their CPU time in microseconds, for the frame-rate overlay.
 void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us);
+// What the scanout copy costs, by step, in nanoseconds (gpupresent::Cost in GpuScanoutPresenter.h, its A4 and A5 rows): frames served, then
+// import, texture, encode, submit and wait; the copy form each frame took (bytes run together, the frame as a linear texture, row by row);
+// the textures it made and those it reused; then the last frame's width, height and stride and the scanout's. Called by the plugin's
+// scanout service after each frame.
+void native_bridge_metal_present_cost(const uint64_t *values);
 // Structured cumulative artifact/driver-cache counters for offline qualification.
 struct NmbShaderCacheStats;
 bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);

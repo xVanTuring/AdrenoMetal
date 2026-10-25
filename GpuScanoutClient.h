@@ -18,6 +18,8 @@
 extern "C" void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us) __attribute__((weak_import));
 // A library from AIR bitcode, which only the native frontend loads (the scale kernel).
 extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
+// What the scanout copy costs, by step (NativeBridgeMetalFrontend.h's A4 row); absent where the frontend is not linked.
+extern "C" void native_bridge_metal_present_cost(const uint64_t *values) __attribute__((weak_import));
 
 namespace gpuscanout {
 
@@ -111,6 +113,16 @@ public:
             stats_->reused = presenter_->imports_[1];
         }
         stats_->lastResult = (int)r;
+        // The copy's cost so far, for the frontend's telemetry (A4, A5): frames, the five steps' ns, the copy forms, the textures made and
+        // reused, and the geometry.
+        if (native_bridge_metal_present_cost) {
+            const gpupresent::Cost &cost = presenter_->cost();
+            const uint64_t values[17] = {cost.frames, cost.importNs, cost.textureNs, cost.encodeNs, cost.submitNs, cost.waitNs,
+                                         cost.forms[0], cost.forms[1], cost.forms[2], cost.texturesMade, cost.texturesReused,
+                                         cost.geometry[0], cost.geometry[1], cost.geometry[2], cost.geometry[3], cost.geometry[4],
+                                         cost.geometry[5]};
+            native_bridge_metal_present_cost(values);
+        }
         const bool scaled = swap.width != scanout_.width || swap.height != scanout_.height;
         if (r == gpupresent::kOk && scaled) ++stats_->scaled;
         // The read-back compares rows one to one; a scaled frame has no such rows.

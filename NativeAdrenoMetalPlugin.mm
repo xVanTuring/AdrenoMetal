@@ -9,6 +9,7 @@
 // NativeAdrenoMetal.clients beside the bundle ("*" lists every process); an unlisted one returns nil and keeps the software renderer.
 #import <Foundation/Foundation.h>
 #include <pthread.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <unistd.h>
 #include <pwd.h>
@@ -317,6 +318,21 @@ static id deviceForPort(unsigned port) {
                 const int imported = cacheexport::importPack(pack, candidates[i]);
                 if (imported) gpu->mark(0x6C00 | (imported < 0 ? 0xff : imported > 0xfe ? 0xfe : imported));
             }
+            // How many Turnip shader-cache files this directory already holds (marker 0x6D00|count, 0xfe saturated): the first boot with
+            // the cache on writes them, and a later boot that shows 0 has lost the cache across the restart.
+            {
+                unsigned cached = 0;
+                if (DIR *dir = opendir(candidates[i])) {
+                    while (struct dirent *entry = readdir(dir))
+                        if (strstr(entry->d_name, "mesa_shader_cache")) ++cached;
+                    closedir(dir);
+                }
+                gpu->mark(0x6D00 | (cached > 0xfe ? 0xfe : cached));
+            }
+            // Turnip's on-disk shader cache (the IR3 binaries of the pipelines it compiles) into the same directory: the build had it
+            // disabled, so every launch recompiled NIR to IR3 from scratch, which is where the render server's pipeline makings go
+            // (2026-10-25: 97 makings, 3.9 s in total, the slowest 529 ms and a frame stalled with it).
+            setenv("MESA_SHADER_CACHE_DIR", candidates[i], 1);
             @try {
                 device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
             } @catch (NSException *exception) {

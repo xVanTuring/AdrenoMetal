@@ -11,6 +11,8 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #include <algorithm>
+#include <dlfcn.h>
+#include <string.h>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -41,6 +43,12 @@ static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gComp
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
+// The shapes of the render passes the render server opens (width, height, colour format, sample count), each counted once: the corner
+// question (2026-10-24: rounded corners drawn in 4 x 4 pixel blocks in GMEM passes) needs to know whether the corners are drawn into the
+// full-screen pass or into a small offscreen one, and whether that pass is multisampled.
+struct NmbPassShape {uint32_t width,height,format,samples;std::atomic<uint64_t> count;};
+static NmbPassShape gPassShapes[6];
+static std::atomic<unsigned> gPassShapeCount;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -48,6 +56,26 @@ struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
+// What each kind of call the render server makes costs on the CPU: the draws, the binds that set them up, the pass's open and close and the
+// commit (2026-10-25: a frame's draws come to about 150 us each, which nothing in the frontend does per draw, so the frame's CPU has to be
+// split by class before anything is changed).
+static Timed gTimeDraw,gTimeBind,gTimePassOpen,gTimePassClose,gTimeCommit;
+// The draws by what they cost: the first of each render encoder (the pass's framebuffer, variant and pools are made then), and the later ones
+// by whether the pipeline state changed since the draw before (A3). A draw is a few microseconds of frontend and one call into the runtime, so
+// what the runtime and Turnip spend inside it is what these split apart.
+static Timed gTimeDrawFirst,gTimeDrawNewState,gTimeDrawSameState;
+// The encoder's state calls, by class (the A7 and A8 rows): the pipeline state, viewport, scissor, depth/stencil state, the raster states
+// (cull mode, winding, fill mode), blend colour, and the rest (depth bias, line width, stencil references, visibility result). A frame's
+// draws take about 3.6 ms and its passes about 1.4 ms, so a frame's CPU above those is here, in CA's own work, or in calls not yet counted.
+enum {kStatePipeline,kStateViewport,kStateScissor,kStateDepthStencil,kStateRaster,kStateBlend,kStateOther,kStateCount};
+static Timed gTimeState[kStateCount];
+// What creating a resource costs on this thread (a texture, a buffer, a surface's import): the encoder's own calls are the A7 and A8 rows.
+static Timed gTimeCreate;
+// The sets that left the encoder's state as it was, by class: what the deduplication above saved (the A7 and A8 rows report both).
+static std::atomic<uint64_t> gStateSkipped[kStateCount];
+// The blit encoder's calls ('A0' row with the draws and binds): the scanout copy is one blit a frame of a 1800x2880 texture, and a
+// texture readback would be the same kind of call.
+static Timed gTimeBlit;
 // Who waits for a command buffer to complete (tb128fu-047: about 41 ms once per swap, so the next frame never overlapped the GPU;
 // tb128fu-049: every frame above the wait outside this plugin was the thread's start): the four return addresses above
 // waitUntilCompleted, each as one letter for its image (P this plugin, Q QuartzCore, M Metal, L libdispatch, T libsystem_pthread,
@@ -107,6 +135,9 @@ struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0,gpuUs=0;int64_t
 // The GPU's own time on command buffers (the runtime's gpuStartTime/gpuEndTime: its timestamp queries), all of them and those with a render
 // pass, against the commit-to-completion time that also holds the queue's wait (round 067: 80-130 ms per compositor command buffer).
 static std::atomic<uint64_t> gGpuTimed,gGpuUs,gGpuPassUs,gGpuUntimed;
+// The GPU time of the render server's two kinds of command buffer: those with a render pass, and the scanout copy's (a blit alone, one per
+// frame: 1894 of 3784 commits in the 45 s round of 2026-10-25).
+static std::atomic<uint64_t> gGpuPassN,gGpuCopyN,gGpuCopyUs;
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
 static std::mutex gProblemLock;
@@ -303,6 +334,27 @@ static void waitForResource(id resource);
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
 // unmap or reuse pages the GPU still reads or writes.
 static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
+// The bytes the CPU puts into a texture or takes out of one (replaceRegion and getBytes): a full-screen 1800x2880 readback is 20 MB and
+// stalls on the GPU that wrote it, which no other row would show, and a frame's CPU has to be accounted for before anything is changed.
+static Timed gTimeRegion;
+static std::atomic<uint64_t> gRegionBytes;
+// What the scanout copy costs, as the plugin's scanout service last reported it (gpupresent::Cost, native_bridge_metal_present_cost): frames,
+// then import, texture, encode, submit and wait in nanoseconds, the copy form each frame took, and the textures made and reused (the A4 row).
+static std::atomic<uint64_t> gPresent[6],gPresentForms[3],gPresentTextures[2],gPresentGeo[6];
+// The runtime's copy census and buffer-texture census (nmb_copy_census, seven words and five), read for the A5 and A6 rows.
+static std::atomic<uint64_t> gCopy[7],gBufTex[5];
+// The runtime's own phasing of a draw, a pass's close and a commit (nmb_phase_timings, fourteen words): where inside those three calls the
+// time goes, which the frontend's own timing of them (A0, A1) cannot tell.
+static std::atomic<uint64_t> gPhase[14];
+static void readCopyCensus() {
+ uint64_t census[12]={};
+ if(nmb_copy_census(census)) {
+  for(unsigned i=0;i<7;i++)gCopy[i].store(census[i]);
+  for(unsigned i=0;i<5;i++)gBufTex[i].store(census[7+i]);
+ }
+ uint64_t phases[14]={};
+ if(nmb_phase_timings(phases))for(unsigned i=0;i<14;i++)gPhase[i].store(phases[i]);
+}
 static void releaseBlock(void *context,void *pointer,uint64_t length) {
  gNoCopyReleased++;
  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
@@ -410,7 +462,10 @@ NB_RESOURCE_SPI
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
- if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+ const uint64_t began=nowUs();
+ const bool ok=nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length);
+ gTimeRegion.add(began);gRegionBytes+=length;
+ if(!ok)NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
@@ -418,7 +473,10 @@ NB_RESOURCE_SPI
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
- if(!nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice))NBLOG(@"native-metal: getBytes refused: %@",lastError());
+ const uint64_t began=nowUs();
+ const bool ok=nmb_texture_get_bytes(_handle,bytes,row,image,length,region,level,slice);
+ gTimeRegion.add(began);gRegionBytes+=length;
+ if(!ok)NBLOG(@"native-metal: getBytes refused: %@",lastError());
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)row fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level {
  [self getBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height fromRegion:r mipmapLevel:level slice:0];
@@ -720,7 +778,9 @@ static void waitForResource(id resource) {
 - (void)endEncoding {
  NmbEncoder *handle=_handle;_handle=nullptr;
  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
+ const uint64_t began=nowUs();
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
+ gTimePassClose.add(began);
 }
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
@@ -729,20 +789,28 @@ static void waitForResource(id resource) {
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ const uint64_t began=nowUs();
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
+ gTimeBind.add(began);
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ const uint64_t began=nowUs();
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ gTimeBind.add(began);
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ const uint64_t began=nowUs();
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+ gTimeBind.add(began);
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
+ const uint64_t began=nowUs();
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
+ gTimeBind.add(began);
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
@@ -792,8 +860,28 @@ static void waitForResource(id resource) {
 @interface NBRenderEncoder : NBEncoder {
 @public
  NSString *censusPipeline,*censusTexture;   // the draw census's pipeline and fragment texture 0 (gDrawCensus)
+ uintptr_t lastPipeline,drawnPipeline;      // the pipeline set now, and the one the previous draw ran under (the A3 row)
+ uint64_t draws;                            // this encoder's draws so far
+ // What this encoder last pushed, so that a set which leaves its state as it is skips the runtime: the pipeline, depth/stencil state,
+ // viewport and scissor sent, and the raster, stencil reference and blend colour values (Metal's defaults 0 until set).
+ // (A new object's ivars are zero, which is Metal's default for each.)
+ uintptr_t lastPipelinePushed,lastDepthStencil;
+ BOOL lastPipelineSet,lastDepthStencilSet,lastViewportSet,lastScissorSet,rasterSet,stencilSet,blendColorSet;
+ double lastViewport[6];
+ uint64_t lastScissor[4];
+ uint32_t rasterCull,rasterWinding,rasterFill,rasterPushed;
+ uint32_t stencilFrontValue,stencilBackValue;
+ float blendColor[4];
 }
 @end
+// The draw's bucket by what it costs (A3): the first of its encoder, then the later ones by whether the pipeline state changed since the draw
+// before it.
+static void noteDrawBucket(NBRenderEncoder *encoder,uint64_t began) {
+ Timed &bucket=!encoder->draws?gTimeDrawFirst:(encoder->drawnPipeline==encoder->lastPipeline?gTimeDrawSameState:gTimeDrawNewState);
+ bucket.add(began);
+ encoder->drawnPipeline=encoder->lastPipeline;
+ ++encoder->draws;
+}
 // The draw census (with Turnip's trace, NativeTurnipTrace): draws counted by pipeline, vertex count and fragment texture 0, written to
 // draws.txt beside the journal every 2000 draws, so that the trace's per-shader draw counts name their pipelines and textures.
 static void censusDraw(NBRenderEncoder *encoder,NSUInteger vertices,NSUInteger instances) {
@@ -814,10 +902,18 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
  return [NSString stringWithFormat:@"%llux%llu f%llu L%llu%s",d.width,d.height,d.format,d.levels,texture.surface?" surface":texture.buffer?" buffer":""];
 }
 @implementation NBRenderEncoder
+// Every setter here skips the runtime when it would leave the encoder's state as it is: Metal's state is the encoder's own, a set of the same
+// value changes nothing, and the runtime's setters only store (a pipeline's set recomputes the same routing of the same state in the same
+// pass). The comparison is the exact value pushed (bytes, not the numbers), so a value that differs in any bit is set again.
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(gDrawCensus)censusPipeline=[(NBRenderPipeline *)state censusName];
+ lastPipeline=(uintptr_t)(__bridge void *)state;
+ if(lastPipelineSet && lastPipelinePushed==lastPipeline){++gStateSkipped[kStatePipeline];return;}
+ lastPipelinePushed=lastPipeline;lastPipelineSet=true;
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
+ gTimeState[kStatePipeline].add(began);gTimeBind.add(began);
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
@@ -843,30 +939,56 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+ const uintptr_t handle=(uintptr_t)(__bridge void *)state;
+ if(lastDepthStencilSet && lastDepthStencil==handle){++gStateSkipped[kStateDepthStencil];return;}
+ lastDepthStencil=handle;lastDepthStencilSet=true;
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
+ gTimeState[kStateDepthStencil].add(began);
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
+ if(lastViewportSet && !memcmp(values,lastViewport,sizeof values)){++gStateSkipped[kStateViewport];return;}
+ memcpy(lastViewport,values,sizeof values);lastViewportSet=true;
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
+ gTimeState[kStateViewport].add(began);
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
+ if(lastScissorSet && !memcmp(values,lastScissor,sizeof values)){++gStateSkipped[kStateScissor];return;}
+ memcpy(lastScissor,values,sizeof values);lastScissorSet=true;
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
+ gTimeState[kStateScissor].add(began);
 }
-// The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
+// The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults (none, clockwise, fill: all 0) until each is
+// set, and pushes the three again only when one of them changes.
 - (void)raster {
- NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
- [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
+ const uint32_t state=rasterCull|(rasterWinding<<2)|(rasterFill<<4);
+ if(rasterSet && rasterPushed==state){++gStateSkipped[kStateRaster];return;}
+ rasterPushed=state;rasterSet=true;
+ const uint64_t began=nowUs();
+ [self check:nmb_render_set_raster(self.handle,rasterCull,rasterWinding,rasterFill) what:"raster state"];
+ gTimeState[kStateRaster].add(began);
 }
-- (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
-- (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
-- (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
+- (void)setCullMode:(MTLCullMode)m {rasterCull=(uint32_t)m;[self raster];}
+- (void)setFrontFacingWinding:(MTLWinding)w {rasterWinding=(uint32_t)w;[self raster];}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)f {rasterFill=(uint32_t)f;[self raster];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"];
+ gTimeState[kStateOther].add(began);
 }
-- (void)setLineWidth:(float)width {[self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];}
+- (void)setLineWidth:(float)width {
+ const uint64_t began=nowUs();
+ [self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"];
+ gTimeState[kStateOther].add(began);
+}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_visibility_mode(self.handle,mode,offset) what:"setVisibilityResultMode"];
+ gTimeState[kStateOther].add(began);
 }
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
  [self setFragmentTexture:t atIndex:ti];[self sampler:s index:si stage:2];
@@ -879,17 +1001,29 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
 - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}
-- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
+- (void)setStencilReferenceValue:(uint32_t)v {[self stencilFront:v back:v];}
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {[self stencilFront:f back:b];}
+- (void)stencilFront:(uint32_t)f back:(uint32_t)b {
+ if(stencilSet && stencilFrontValue==f && stencilBackValue==b){++gStateSkipped[kStateOther];return;}
+ stencilFrontValue=f;stencilBackValue=b;stencilSet=true;
+ const uint64_t began=nowUs();
  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
+ gTimeState[kStateOther].add(began);
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
- const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+ const float c[4]={r,g,b,a};
+ if(blendColorSet && !memcmp(c,blendColor,sizeof c)){++gStateSkipped[kStateBlend];return;}
+ memcpy(blendColor,c,sizeof c);blendColorSet=true;
+ const uint64_t began=nowUs();
+ [self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
+ gTimeState[kStateBlend].add(began);
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(gDrawCensus)censusDraw(self,n,i);
+ const uint64_t began=nowUs();
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
+ gTimeDraw.add(began);noteDrawBucket(self,began);
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
@@ -903,7 +1037,9 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
  if(gDrawCensus)censusDraw(self,n,i);
+ const uint64_t began=nowUs();
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
+ gTimeDraw.add(began);noteDrawBucket(self,began);
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)i {
@@ -939,17 +1075,23 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
+ const uint64_t began=nowUs();
  [self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"];
+ gTimeBlit.add(began);
 }
 - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
  if(![self buffers:NB_OBJECTS(b) count:1])return;
+ const uint64_t began=nowUs();
  [self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"];
+ gTimeBlit.add(began);
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+ const uint64_t began=nowUs();
  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
+ gTimeBlit.add(began);
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
@@ -965,17 +1107,23 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
      destinationOrigin:(MTLOrigin)dO {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+ const uint64_t began=nowUs();
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
+ gTimeBlit.add(began);
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
+ const uint64_t began=nowUs();
  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
+ gTimeBlit.add(began);
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
+ const uint64_t began=nowUs();
  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
+ gTimeBlit.add(began);
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
 @end
@@ -1044,6 +1192,10 @@ static void scheduled(void *context);
    gPasses++;gPassPixels+=pixels;encodedWork.passes++;encodedWork.pixels+=pixels;
    uint64_t seen=gBiggestPass.load();while(pixels>seen && !gBiggestPass.compare_exchange_weak(seen,pixels)){}
    if(pixels>=2000000)gFullScreenPasses++;
+   const uint32_t w=(uint32_t)first.width,h=(uint32_t)first.height,f=(uint32_t)first.pixelFormat,s=(uint32_t)first.sampleCount;
+   unsigned n=0;const unsigned have=gPassShapeCount.load();
+   for(;n<have&&n<6;n++)if(gPassShapes[n].width==w&&gPassShapes[n].height==h&&gPassShapes[n].format==f&&gPassShapes[n].samples==s)break;
+   if(n<6){if(n==have){gPassShapes[n].width=w;gPassShapes[n].height=h;gPassShapes[n].format=f;gPassShapes[n].samples=s;gPassShapeCount.store(n+1);}gPassShapes[n].count++;}
   }
  }
  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
@@ -1067,7 +1219,10 @@ static void scheduled(void *context);
   [_resourceOwners addObject:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
- return [self encoder:[NBRenderEncoder new] handle:self.committed?nullptr:nmb_render_encoder_new(_handle,&pass) what:@"renderCommandEncoder"];
+ const uint64_t began=nowUs();
+ NmbEncoder *encoder=self.committed?nullptr:nmb_render_encoder_new(_handle,&pass);
+ gTimePassOpen.add(began);
+ return [self encoder:[NBRenderEncoder new] handle:encoder what:@"renderCommandEncoder"];
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
@@ -1140,11 +1295,15 @@ static void scheduled(void *context);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
+  // The commit as a whole: the surfaces' flush, then the submission itself (the CPU's cost per commit, which the A1 row reports).
+  const uint64_t began=nowUs();
   flushSurfaces(_surfaces);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
-  if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
+  const bool submitted=nmb_command_buffer_on_completed(_handle,completed,context) &&
+     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle);
+  gTimeCommit.add(began);
+  if(submitted)return;
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
@@ -1180,7 +1339,8 @@ static void completed(void *context) {
   uint64_t seen=gTimeEncodeToCommit.slowest.load();while(took>seen && !gTimeEncodeToCommit.slowest.compare_exchange_weak(seen,took)){}
   const double gpuStart=nmb_command_buffer_gpu_time(commandBuffer.handle,false),gpuEnd=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
   const uint64_t gpu=(gpuEnd>gpuStart && gpuStart>0)?(uint64_t)((gpuEnd-gpuStart)*1e6):0;
-  if(gpu){gGpuTimed++;gGpuUs+=gpu;if(commandBuffer->encodedWork.passes)gGpuPassUs+=gpu;}else gGpuUntimed++;
+  if(gpu){gGpuTimed++;gGpuUs+=gpu;
+   if(commandBuffer->encodedWork.passes){gGpuPassUs+=gpu;gGpuPassN++;}else{gGpuCopyUs+=gpu;gGpuCopyN++;}}else gGpuUntimed++;
   std::lock_guard<std::mutex> lock(gCommitLock);
   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
   if(r.index==commandBuffer.commitIndex){r.callbackUs=took;r.gpuUs=gpu;}
@@ -1530,7 +1690,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
+ const uint64_t began=nowUs();
+ NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);gTimeCreate.add(began);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
@@ -1553,7 +1714,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
- NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+ const uint64_t began=nowUs();
+ NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);gTimeCreate.add(began);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
 }
@@ -1571,7 +1733,10 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  const size_t bytes=(allocation+page-1)&~(page-1);
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+ const uint64_t imported=nowUs();
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes);
+ gTimeCreate.add(imported);
+ if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  // Each kind of texture over a surface once in the journal ("T" lines): its size, format, usage and storage, the surface's pixel format,
  // rows and allocation, and whether the runtime made it, so that its messages.log notices (a shadowed texture's copies) meet their surface.
@@ -1737,10 +1902,21 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
  // blends by framebuffer fetch with from supportsFamily:MTLGPUFamilyApple1 alone (QuartzCore 0x189562720 in iPadOS 17.7.11), whatever
  // the later families answer.
  // That alone changed nothing (tb128fu-081); "apple-families" withholds every Apple family (1001-1999), leaving the common ones.
+ // Apple2 stays answered, but only in Preferences: Core Image's Metal gate is supportsFamily:MTLGPUFamilyApple2 (can_use_metal in
+ // -[CIContext initWithOptions:], CoreImage 0x197550218), and with every family withheld it takes the OpenGL ES fallback this port has
+ // none of (CI::GLContext::init filled a zero function table and jumped to 0: Preferences in Accessibility and iconservicesagent,
+ // 2026-10-25). Answering it everywhere stalled the render server at boot (rounds 084558 and 085127: 13-24 commits, then nothing,
+ // SpringBoard twelve threads all waiting), so it stays off for the render server and the icon daemon; set NMB_APPLE2_CLIENTS to a
+ // comma-separated list to widen it. Core Animation's framebuffer-fetch blend reads Apple1 alone, so withholding 1001 keeps that cheap.
  static const SEL family=sel_registerName("supportsFamily:");
  static const bool withholdApple1=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple1-family");}();
  static const bool withholdApple=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple-families");}();
- if(cmd==family && ((withholdApple1 && arg==1001) || (withholdApple && arg>=1001 && arg<2000)))value=0;
+ static const bool apple2Client=[]{const char *list=getenv("NMB_APPLE2_CLIENTS");if(!list)list="Preferences";
+  const char *name=getprogname();if(!name)return false;const size_t len=strlen(name);
+  for(const char *at=list;*at;) {const char *end=strchr(at,',');const size_t part=end?(size_t)(end-at):strlen(at);
+   if(part==len && !strncmp(at,name,len))return true;if(!end)break;at=end+1;}
+  return false;}();
+ if(cmd==family && ((withholdApple1 && arg==1001) || (withholdApple && arg>=1001 && arg<2000 && !(apple2Client && arg==1002))))value=0;
  std::lock_guard<std::mutex> lock(gArgAnswerLock);
  gArgAnswers[cmd][arg]=value;
  return value;
@@ -1928,47 +2104,141 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
 // The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
+ // Turnip's own render pass notes (tu_util.cc, exported as tu_pipa_note_dump): Turnip has no log route in the render server, and its
+ // pass geometry (area, format, samples, mode, tile size, GMEM offset) is what tells GMEM's 4-row slices apart (2026-10-24).
+ static unsigned (*turnipNotes)(char *, unsigned);static int turnipTried;
+ if(!turnipTried) {
+  turnipTried=1;
+  Dl_info info={};
+  if(dladdr((const void *)&native_bridge_metal_telemetry,&info) && info.dli_fname) {
+   char path[1024];snprintf(path,sizeof path,"%s",info.dli_fname);
+   char *slash=strrchr(path,'/');
+   if(slash) {
+    snprintf(slash+1,sizeof path-(size_t)(slash+1-path),"libvulkan_freedreno.dylib");
+    if(void *lib=dlopen(path,RTLD_NOW|RTLD_LOCAL)) turnipNotes=(unsigned (*)(char *,unsigned))dlsym(lib,"tu_pipa_note_dump");
+   }
+  }
+ }
+ // The rows go out in the order they are read (perf report of 2026-10-25): a frame and its waits, where the frame's CPU went, the GPU's own
+ // time, then the rest, and Turnip's notes last in whatever room is left. The kernel keeps the first 48 rows of a dump only
+ // (NativeAdrenoPublish.cpp's native_adreno_metal_rows[48]) and prints the rows whose text changed, so a row pushed past the 48th is never
+ // seen again: the notes (a row per distinct pass, up to 32) had pushed the frame, GPU and per-commit rows out, and those froze at their
+ // early values while the counters behind them kept growing.
+ unsigned rows=0;
  auto row=[&](const char *format,auto... args){
+  if(rows>=48)return;
   char text[200];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>90)n=90;
-  if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
+  if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;++rows;};
  auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
- {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
+ auto mean=[](const Timed &t){const uint64_t n=t.count.load();return (unsigned long long)(n?t.total.load()/n:0);};
+ readCopyCensus();
  row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
- row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
- row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
- row("T function n=%llu total=%llums max=%llums",
-  (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
- row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
-  ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
- row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
- row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
- {
-  std::lock_guard<std::mutex> lock(gWaitSiteLock);
-  for(unsigned i=0;i<4 && gWaitSites[i].count;i++) {
-   const WaitSite &w=gWaitSites[i];
-   row("C%u x%llu %c%lx %c%lx %c%lx %c%lx",i,(unsigned long long)w.count,w.image[0]?w.image[0]:'-',(unsigned long)w.offset[0],
-    w.image[1]?w.image[1]:'-',(unsigned long)w.offset[1],w.image[2]?w.image[2]:'-',(unsigned long)w.offset[2],
-    w.image[3]?w.image[3]:'-',(unsigned long)w.offset[3]);
-  }
- }
- row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
- row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
- row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
-  (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
-  (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
- row("V gpu timed %llu untimed %llu total=%llums passes=%llums",(unsigned long long)gGpuTimed.load(),(unsigned long long)gGpuUntimed.load(),
-  ms(gGpuUs.load()),ms(gGpuPassUs.load()));
  row("U n=%llu cpu=%llums wall=%llums c %llu %llu %llu %llu|%llu %llu %llu %llu",(unsigned long long)gFrameCostN.load(),
   ms(gFrameCpuUs.load()),ms(gFrameWallUs.load()),(unsigned long long)gFrameCores[0].load(),
   (unsigned long long)gFrameCores[1].load(),(unsigned long long)gFrameCores[2].load(),(unsigned long long)gFrameCores[3].load(),
   (unsigned long long)gFrameCores[4].load(),(unsigned long long)gFrameCores[5].load(),(unsigned long long)gFrameCores[6].load(),
   (unsigned long long)gFrameCores[7].load());
- row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
-  (unsigned long long)gNoCopyMade.load(),
-  (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
+ row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
+  ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)mean(gTimeEncodeToCommit));
+ row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
+ row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
+ row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
+ row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
+ row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
+  (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
+  (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ // The frame's CPU by class of call (count, total and mean per call; the draws' slowest too): the draws, every bind that sets one up
+ // (buffers, textures, samplers, inline bytes, the pipeline state), the blit encoder's copies, the pass's open and its close, and the commit
+ // with the surfaces it flushes. The frontend only calls the runtime, so a draw or a bind past a few microseconds is time the runtime and
+ // Turnip spend inside it.
+ row("A0 draw %llu %llums/%lluus/%lluus | bind %llu %llums/%lluus | blit %llu %llums/%lluus",(unsigned long long)gTimeDraw.count.load(),
+  ms(gTimeDraw.total.load()),mean(gTimeDraw),(unsigned long long)gTimeDraw.slowest.load(),(unsigned long long)gTimeBind.count.load(),
+  ms(gTimeBind.total.load()),mean(gTimeBind),(unsigned long long)gTimeBlit.count.load(),ms(gTimeBlit.total.load()),mean(gTimeBlit));
+ row("A1 open %llu %llums/%lluus | close %llu %llums/%lluus | commit %llu %llums/%lluus",(unsigned long long)gTimePassOpen.count.load(),
+  ms(gTimePassOpen.total.load()),mean(gTimePassOpen),(unsigned long long)gTimePassClose.count.load(),ms(gTimePassClose.total.load()),
+  mean(gTimePassClose),(unsigned long long)gTimeCommit.count.load(),ms(gTimeCommit.total.load()),mean(gTimeCommit));
+ row("V gpu timed %llu untimed %llu total=%llums passes=%llums",(unsigned long long)gGpuTimed.load(),(unsigned long long)gGpuUntimed.load(),
+  ms(gGpuUs.load()),ms(gGpuPassUs.load()));
+ // The GPU's own time by kind of command buffer: those with a render pass, and the scanout copy's, which is one commit a frame of a blit
+ // and nothing else (1894 of 3784 commits in the 45 s round of 2026-10-25).
+ row("A2 gpu pass n=%llu %llums/%lluus | copy n=%llu %llums/%lluus",(unsigned long long)gGpuPassN.load(),ms(gGpuPassUs.load()),
+  (unsigned long long)(gGpuPassN.load()?gGpuPassUs.load()/gGpuPassN.load():0),(unsigned long long)gGpuCopyN.load(),ms(gGpuCopyUs.load()),
+  (unsigned long long)(gGpuCopyN.load()?gGpuCopyUs.load()/gGpuCopyN.load():0));
+ // The draws by what they cost (count, total, mean): the first of each render encoder, then the later ones by whether the pipeline state
+ // changed since the draw before (A3). A draw is a few microseconds of frontend and one call into the runtime, so the rest is the runtime's and
+ // Turnip's work inside it.
+ row("A3 draw first %llu %llums/%lluus | state %llu %llums/%lluus | same %llu %llums/%lluus",(unsigned long long)gTimeDrawFirst.count.load(),
+  ms(gTimeDrawFirst.total.load()),mean(gTimeDrawFirst),(unsigned long long)gTimeDrawNewState.count.load(),ms(gTimeDrawNewState.total.load()),
+  mean(gTimeDrawNewState),(unsigned long long)gTimeDrawSameState.count.load(),ms(gTimeDrawSameState.total.load()),mean(gTimeDrawSameState));
+ // The scanout copy, as the service that runs it reports (gpupresent::Cost): frames served, the copy form each took (bytes run together / the
+ // frame as a linear texture / row by row), the ns of import, texture, encode, submit and wait a frame, and the textures made and reused.
+ // The scanout copy, as the service that runs it reports (gpupresent::Cost): the frames served, the copy form each took (the frame's rows
+ // and the scanout's run together / the frame as a linear texture over its pages / row by row), the geometry, and the textures it made
+ // and reused. Its five steps are the A5 row.
+ row("A4 present %llu %llu/%llu/%llu geo %llux%llu/%llu o%llux%llu/%llu tx%llu/%llu",(unsigned long long)gPresent[0].load(),
+  (unsigned long long)gPresentForms[0].load(),(unsigned long long)gPresentForms[1].load(),(unsigned long long)gPresentForms[2].load(),
+  (unsigned long long)gPresentGeo[0].load(),(unsigned long long)gPresentGeo[1].load(),(unsigned long long)gPresentGeo[2].load(),
+  (unsigned long long)gPresentGeo[3].load(),(unsigned long long)gPresentGeo[4].load(),(unsigned long long)gPresentGeo[5].load(),
+  (unsigned long long)gPresentTextures[0].load(),(unsigned long long)gPresentTextures[1].load());
+ // What those presents cost a frame, in microseconds, and the runtime's copy census (nmb_copy_census): the copies out of a texture, the
+ // ones that took one buffer-image copy (img), one buffer copy a row (rows) or a staging buffer (stg), the regions those recorded, and the
+ // last rows copy's row count. rows > 0 with a 1800 x 2880 frame is 2880 regions a frame, 5.5 ms of CPU.
+ row("A5 imp%llu tex%llu enc%llu sub%llu wait%llu us | copy %llu img%llu rows%llu reg%llu/%llu r%llu",
+  (unsigned long long)(gPresent[0].load()?gPresent[1].load()/gPresent[0].load()/1000:0),
+  (unsigned long long)(gPresent[0].load()?gPresent[2].load()/gPresent[0].load()/1000:0),
+  (unsigned long long)(gPresent[0].load()?gPresent[3].load()/gPresent[0].load()/1000:0),
+  (unsigned long long)(gPresent[0].load()?gPresent[4].load()/gPresent[0].load()/1000:0),
+  (unsigned long long)(gPresent[0].load()?gPresent[5].load()/gPresent[0].load()/1000:0),
+  (unsigned long long)gCopy[0].load(),(unsigned long long)gCopy[1].load(),(unsigned long long)gCopy[2].load(),
+  (unsigned long long)gCopy[4].load(),(unsigned long long)gCopy[5].load(),(unsigned long long)gCopy[6].load());
+ // The buffer textures the runtime made: those whose linear image is the buffer's own bytes (alias), those whose is not, and the last one's
+ // row pitch against the driver's, which decides it: the driver's linear pitch is Metal's only when it is 256-byte aligned.
+ row("A6 buffer tex alias%llu no%llu pitch %llu/%llu align%llu",(unsigned long long)gBufTex[0].load(),(unsigned long long)gBufTex[1].load(),
+  (unsigned long long)gBufTex[2].load(),(unsigned long long)gBufTex[3].load(),(unsigned long long)gBufTex[4].load());
+ // The encoder's state calls, by class (count, total and mean), and the sets each class skipped because they changed nothing: a frame's
+ // draws and passes come to about 5 ms, so a frame's CPU above that is here, in CA's own work, or in calls not yet counted.
+ row("A7 ps %llu %llums/%lluus sk%llu | vp %llu %llums/%lluus sk%llu | sc %llu %llums/%lluus sk%llu",
+  (unsigned long long)gTimeState[kStatePipeline].count.load(),ms(gTimeState[kStatePipeline].total.load()),mean(gTimeState[kStatePipeline]),
+  (unsigned long long)gStateSkipped[kStatePipeline].load(),
+  (unsigned long long)gTimeState[kStateViewport].count.load(),ms(gTimeState[kStateViewport].total.load()),mean(gTimeState[kStateViewport]),
+  (unsigned long long)gStateSkipped[kStateViewport].load(),
+  (unsigned long long)gTimeState[kStateScissor].count.load(),ms(gTimeState[kStateScissor].total.load()),mean(gTimeState[kStateScissor]),
+  (unsigned long long)gStateSkipped[kStateScissor].load());
+ row("A8 ds %llu %llums/%lluus sk%llu | ra %llu %llums/%lluus sk%llu | mix %llu %llums/%lluus | new %llu %llums",
+  (unsigned long long)gTimeState[kStateDepthStencil].count.load(),ms(gTimeState[kStateDepthStencil].total.load()),
+  mean(gTimeState[kStateDepthStencil]),(unsigned long long)gStateSkipped[kStateDepthStencil].load(),
+  (unsigned long long)gTimeState[kStateRaster].count.load(),ms(gTimeState[kStateRaster].total.load()),mean(gTimeState[kStateRaster]),
+  (unsigned long long)gStateSkipped[kStateRaster].load(),
+  (unsigned long long)(gTimeState[kStateBlend].count.load()+gTimeState[kStateOther].count.load()),
+  ms(gTimeState[kStateBlend].total.load()+gTimeState[kStateOther].total.load()),
+  (unsigned long long)((gTimeState[kStateBlend].count.load()+gTimeState[kStateOther].count.load())
+   ?(gTimeState[kStateBlend].total.load()+gTimeState[kStateOther].total.load())/(gTimeState[kStateBlend].count.load()+gTimeState[kStateOther].count.load()):0),
+  (unsigned long long)gTimeCreate.count.load(),ms(gTimeCreate.total.load()));
+ // Where the runtime spends the draw, the close and the commit (its own phases, in microseconds a call): the draw's bind state and
+ // variant, the command it builds, the heaps and descriptors, the record; the close's pass end, its shadow copies, its bookkeeping; the
+ // commit's state collection, its host steps, its planning, its submit. The counts close each row.
+ row("D draw us settle%llu cmd%llu heap%llu rec%llu n%llu",(unsigned long long)gPhase[11].load()?gPhase[0].load()/gPhase[11].load()/1000:0,
+  (unsigned long long)(gPhase[0+1].load()/1000/(gPhase[11].load()?gPhase[11].load():1)),
+  (unsigned long long)(gPhase[2].load()/1000/(gPhase[11].load()?gPhase[11].load():1)),
+  (unsigned long long)(gPhase[3].load()/1000/(gPhase[11].load()?gPhase[11].load():1)),(unsigned long long)gPhase[11].load());
+ row("C close us pass%llu sh%llu book%llu n%llu",(unsigned long long)(gPhase[4].load()/1000/(gPhase[12].load()?gPhase[12].load():1)),
+  (unsigned long long)(gPhase[5].load()/1000/(gPhase[12].load()?gPhase[12].load():1)),
+  (unsigned long long)(gPhase[6].load()/1000/(gPhase[12].load()?gPhase[12].load():1)),(unsigned long long)gPhase[12].load());
+ row("B commit us state%llu prep%llu plan%llu sub%llu n%llu",(unsigned long long)(gPhase[7].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),
+  (unsigned long long)(gPhase[8].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),
+  (unsigned long long)(gPhase[9].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),
+  (unsigned long long)(gPhase[10].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),(unsigned long long)gPhase[13].load());
+ row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
+ row("T function n=%llu total=%llums max=%llums",
+  (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
+ row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu | region n=%llu %llums/%lluus %lluMB",(unsigned long long)gNoCopyAll.load(),
+  (unsigned long long)gNoCopyReleased.load(),(unsigned long long)gNoCopyMade.load(),
+  (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load(),
+  (unsigned long long)gTimeRegion.count.load(),ms(gTimeRegion.total.load()),mean(gTimeRegion),
+  (unsigned long long)(gRegionBytes.load()>>20));
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
@@ -1991,16 +2261,45 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
  }
  {
+  std::lock_guard<std::mutex> lock(gWaitSiteLock);
+  for(unsigned i=0;i<2 && gWaitSites[i].count;i++) {
+   const WaitSite &w=gWaitSites[i];
+   row("C%u x%llu %c%lx %c%lx %c%lx %c%lx",i,(unsigned long long)w.count,w.image[0]?w.image[0]:'-',(unsigned long)w.offset[0],
+    w.image[1]?w.image[1]:'-',(unsigned long)w.offset[1],w.image[2]?w.image[2]:'-',(unsigned long)w.offset[2],
+    w.image[3]?w.image[3]:'-',(unsigned long)w.offset[3]);
+  }
+ }
+ {
+  const unsigned have=gPassShapeCount.load()<3?gPassShapeCount.load():3;
+  for(unsigned i=0;i<have;i++)
+   row("Y pass %ux%u f%u s%u n%llu",gPassShapes[i].width,gPassShapes[i].height,gPassShapes[i].format,gPassShapes[i].samples,
+    (unsigned long long)gPassShapes[i].count.load());
+ }
+ {
   std::lock_guard<std::mutex> lock(gCommitLock);
   const uint32_t newest=(uint32_t)gCommits.load();
   row("%s","Q timing v2: per-buffer API counts; ctc=commit-to-callback; age includes caller idle");
-  for(uint32_t k=0;k<20 && k<newest;k++) {
+  // The last four commits only: the ring is the row budget's most expensive part, and the heaviest commit is among the last few.
+  for(uint32_t k=0;k<2 && k<newest;k++) {
    const CommitRecord &r=gCommitRing[(newest-k)%32];
    if(r.index!=newest-k)continue;
    row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus gpu=%lluus",r.index,(unsigned long long)(r.committedUs/1000000),
     (unsigned long long)((r.committedUs/1000)%1000),r.work.passes,r.work.draws,(unsigned long long)(r.work.pixels>>10),r.work.dispatches,r.work.blits,
     (unsigned long long)r.callbackUs,(unsigned long long)r.gpuUs);
-   if(k<4)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
+   if(k==0)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
+  }
+ }
+ // The benchmark's rows (native_bridge_metal_benchmark) are for the host tools, which read the table whole.
+ {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
+ // Turnip's own render pass notes (tu_util.cc, exported as tu_pipa_note_dump): Turnip has no log route in the render server, and its
+ // pass geometry (area, format, samples, mode, tile size, GMEM offset) is what tells GMEM's 4-row slices apart (2026-10-24). Last, so the
+ // rows above are never pushed out of the kernel's 48 (the corner work that needs these can move them up).
+ if(turnipNotes) {
+  char notes[32*120+32];unsigned n=turnipNotes(notes,sizeof notes);
+  for(char *line=notes;line<notes+n;) {
+   char *eol=strchr(line,'\n');if(!eol)break;*eol=0;
+   if(*line)row("Z %s",line);
+   line=eol+1;
   }
  }
  return at;
@@ -2009,6 +2308,15 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
 extern "C" void native_bridge_metal_frame_cost(uint64_t *frames,uint64_t *cpu_us) {
  if(frames)*frames=gFrameCostN.load();
  if(cpu_us)*cpu_us=gFrameCpuUs.load();
+}
+
+// The scanout service's cost so far (native_bridge_metal_present_cost): frames, the ns of import, texture, encode, submit and wait, the copy
+// forms taken, and the textures made and reused.
+extern "C" void native_bridge_metal_present_cost(const uint64_t *values) {
+ for(unsigned i=0;i<6;i++)gPresent[i].store(values[i]);
+ gPresentForms[0].store(values[6]);gPresentForms[1].store(values[7]);gPresentForms[2].store(values[8]);
+ gPresentTextures[0].store(values[9]);gPresentTextures[1].store(values[10]);
+ for(unsigned i=0;i<6;i++)gPresentGeo[i].store(values[11+i]);
 }
 
 extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
