@@ -109,7 +109,9 @@ static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
 static Timed gTimeSurfaceFlush;
 static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
-struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
+// What a command buffer held, and the texture and buffer work that led to it (a replaceRegion, a texture or buffer made, a surface
+// imported, a buffer-to-texture copy): counted on the thread that encodes and commits, read by the H rows at its completion.
+struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;uint32_t tex,buf;};
 // Where the compositor's frames are prepared: at each commit with a render pass, the committing thread's CPU time (user and system) and
 // the wall time since its previous such commit, and the core it committed from (TPIDR_EL0's CPU number; on SM6225 cores 0-3 are the
 // A53s, 4-7 the A73s). A gap past 200 ms is the compositor at rest and is not counted.
@@ -140,6 +142,84 @@ static std::atomic<uint64_t> gGpuTimed,gGpuUs,gGpuPassUs,gGpuUntimed;
 static std::atomic<uint64_t> gGpuPassN,gGpuCopyN,gGpuCopyUs;
 static CommitRecord gCommitRing[32];
 static std::mutex gCommitLock;
+// Whether a stall is periodic, what a heavy commit holds, and how often one is heavy: the K ring (32 commits, printed once each) could say none
+// of it. Every 5 s of frames becomes one W5 row (fps, the frame intervals' classes, the frames' GPU mean and 99th, their passes and pixels), the
+// five heaviest commits of the last minute the H1..H5 rows (with the time they committed, their composition, and the texture and buffer work
+// that led to them), and the commit GPU times past 8, 16 and 32 ms the X row. Fed at each completion; diagnostic only.
+struct HeavyCommit {uint64_t at;uint32_t gpu,ctc;uint32_t passes,draws;uint64_t kpx;uint32_t tex,buf;};
+struct FrameWindow {
+ uint64_t start;          // when this window's first frame committed
+ uint64_t lastFrame;      // when its previous frame did
+ uint32_t frames,onTime,late,slow;
+ uint64_t passes,kpx;
+ uint32_t gpuUs[1024];
+ uint32_t gpuCount;
+ uint64_t spikes[5];      // commits past 8, 16 and 32 ms of GPU, then past 16 and 32 ms of commit-to-callback
+ HeavyCommit heavy[5];    // the heaviest of the last minute, by GPU time
+ // The last window that closed, which the W5 row prints.
+ uint32_t valid;
+ uint64_t fps,mean,p99,rpX10,kpxMean;
+};
+static FrameWindow gWindow;
+static std::mutex gWindowLock;
+// The texture and buffer work since the last commit: a replaceRegion, a texture or buffer made, a surface imported, a buffer-to-texture copy.
+// Thread-local: the render server makes them on the thread that commits.
+static thread_local uint32_t tTextureOps,tBufferOps;
+static void noteCommitWork(CommitRecord r,uint32_t gpu) {
+ const uint64_t at=r.committedUs;
+ std::lock_guard<std::mutex> lock(gWindowLock);
+ FrameWindow &w=gWindow;
+ if(!w.start)w.start=at;
+ // The frames: a command buffer with a render pass, its interval since the previous one (under 200 ms: a screen at rest is neither on time
+ // nor slow), its passes and pixels, and its GPU time.
+ if(r.work.passes){
+  ++w.frames;w.passes+=r.work.passes;w.kpx+=r.work.pixels>>10;
+  if(w.lastFrame){const uint64_t gap=at>w.lastFrame?at-w.lastFrame:0;
+   if(gap && gap<200000){if(gap<=16700)++w.onTime;else if(gap<=33000)++w.late;else ++w.slow;}}
+  w.lastFrame=at;
+  if(w.gpuCount<sizeof w.gpuUs/sizeof w.gpuUs[0])w.gpuUs[w.gpuCount++]=(uint32_t)gpu;
+ }
+ if(gpu>8000)++w.spikes[0];
+ if(gpu>16000)++w.spikes[1];
+ if(gpu>32000)++w.spikes[2];
+ if(r.callbackUs>16000)++w.spikes[3];
+ if(r.callbackUs>32000)++w.spikes[4];
+ // The heaviest of the last minute: the lightest of the five goes where one is heavier, and one older than the minute goes first.
+ if(gpu){
+  int slot=-1;
+  for(unsigned i=0;i<5;i++)if(w.heavy[i].at+60000000ull<at)w.heavy[i]=HeavyCommit{};
+  for(unsigned i=0;i<5 && slot<0;i++)if(!w.heavy[i].at)slot=(int)i;
+  if(slot<0){
+   int lightest=0;
+   for(unsigned i=1;i<5;i++)if(w.heavy[i].gpu<w.heavy[lightest].gpu)lightest=(int)i;
+   if(gpu>w.heavy[lightest].gpu)slot=lightest;
+  }
+  if(slot>=0){HeavyCommit &h=w.heavy[slot];
+   h.at=at;h.gpu=gpu;h.ctc=(uint32_t)r.callbackUs;h.passes=r.work.passes;h.draws=r.work.draws;
+   h.kpx=r.work.pixels>>10;h.tex=r.work.tex;h.buf=r.work.buf;}
+ }
+ // A window publishes after 5 s of frames, and when the screen rests (a gap of 200 ms or more ends it): its frames a second over the span
+ // they took, their GPU mean and 99th, their passes (times ten, a frame) and their pixels.
+ const bool rested=w.lastFrame && at-w.lastFrame>=200000;
+ if(at-w.start<5000000 && !rested)return;
+ const uint64_t end=w.lastFrame?w.lastFrame:at;
+ const uint64_t span=end>w.start?end-w.start:1;
+ uint64_t gpuSum=0;
+ for(uint32_t i=0;i<w.gpuCount;i++)gpuSum+=w.gpuUs[i];
+ if(w.frames){
+  w.valid=1;
+  w.fps=(uint64_t)w.frames*1000000ull/span;
+  w.mean=w.gpuCount?gpuSum/w.gpuCount:0;
+  w.p99=0;
+  if(w.gpuCount){
+   std::sort(w.gpuUs,w.gpuUs+w.gpuCount);
+   w.p99=w.gpuUs[w.gpuCount>1?((uint64_t)(w.gpuCount-1)*99)/100:0];
+  }
+  w.rpX10=(w.passes*10)/w.frames;
+  w.kpxMean=w.kpx/w.frames;
+ }
+ w.start=at;w.lastFrame=0;w.frames=w.onTime=w.late=w.slow=0;w.passes=w.kpx=0;w.gpuCount=0;
+}
 static std::mutex gProblemLock;
 static char gLastProblems[2][200];
 static void noteProblem(NSString *what) {
@@ -239,6 +319,142 @@ static void writeProfile(const std::map<std::vector<uint64_t>,uint32_t> &stacks,
  fclose(f);
  rename(temporary.c_str(),gProfilePath.c_str());
 }
+// The same profile as telemetry rows (PR, native_bridge_metal_telemetry): profile.txt sits on the tablet's Data, which no host tool reads,
+// so the kernel log is the only way out. The rows give the images (a letter each, with their leaf samples), the functions by their own
+// samples and by the samples they are anywhere in (dladdr's symbol start: exact for the plugin and Turnip, the closest exported symbol
+// for the shared cache's images), the call sites by the samples they are in (exact return addresses, for the host's symbolizer), and the
+// waits by the call site of the system call. Offsets are from each image's header; the rows go out a page at a time.
+static std::mutex gProfileRowsLock;
+static std::vector<std::string> gProfileRows;
+static void summarizeProfile(const std::map<std::vector<uint64_t>,uint32_t> &stacks,const std::map<std::vector<uint64_t>,uint32_t> &waits,
+                             uint64_t running,uint64_t waiting) {
+ struct Where {char image;uint64_t offset,start;};
+ std::unordered_map<uint64_t,Where> where;std::vector<std::string> images;
+ auto locate=[&](uint64_t address)->Where {
+  auto known=where.find(address);
+  if(known!=where.end())return known->second;
+  Where w{'?',address,address};
+  Dl_info info{};
+  if(dladdr((const void *)address,&info) && info.dli_fname) {
+   const char *name=strrchr(info.dli_fname,'/');name=name?name+1:info.dli_fname;
+   size_t i=std::find(images.begin(),images.end(),std::string(name))-images.begin();
+   if(i==images.size())images.push_back(name);
+   w.image=i<26?(char)('a'+i):i<52?(char)('A'+i-26):'?';
+   w.offset=address-(uint64_t)info.dli_fbase;
+   w.start=info.dli_saddr?(uint64_t)info.dli_saddr-(uint64_t)info.dli_fbase:w.offset;
+  }
+  where.emplace(address,w);return w;
+ };
+ typedef std::map<std::pair<char,uint64_t>,uint64_t> Counts;
+ Counts own,in,sites,waited;std::map<char,uint64_t> leaves;
+ for(const auto &entry:stacks) {
+  std::set<std::pair<char,uint64_t>> seenFunctions,seenSites;
+  for(size_t i=0;i<entry.first.size();i++) {
+   const Where w=locate(entry.first[i]);
+   // A leaf in the plugin or Turnip by its 64-byte bucket: their local symbols are stripped on the tablet, so dladdr's symbol start is
+   // the closest exported function, and the host's symbolizer (with the build's dSYM) folds the buckets into functions.
+   if(!i) {
+    const size_t li=w.image>='a'?(size_t)(w.image-'a'):(size_t)(w.image-'A'+26);
+    const bool own_code=w.image!='?' && li<images.size() &&
+     (images[li].find("NativeAdrenoMetal")!=std::string::npos || images[li].find("libvulkan")!=std::string::npos);
+    own[{w.image,own_code?(w.offset&~(uint64_t)63):w.start}]+=entry.second;leaves[w.image]+=entry.second;
+   }
+   if(seenFunctions.insert({w.image,w.start}).second)in[{w.image,w.start}]+=entry.second;
+   if(i && seenSites.insert({w.image,w.offset}).second)sites[{w.image,w.offset}]+=entry.second;
+  }
+ }
+ // Who is under the system calls and the allocator: for a sample whose leaf is in libsystem_kernel or libsystem_malloc, its first frame
+ // in the plugin or in Turnip (the code that asked), keyed with the leaf's letter.
+ Counts askers;
+ for(const auto &entry:stacks) {
+  if(entry.first.empty())continue;
+  const Where leaf=locate(entry.first[0]);
+  const size_t li=leaf.image>='a'?(size_t)(leaf.image-'a'):(size_t)(leaf.image-'A'+26);
+  if(leaf.image=='?' || li>=images.size())continue;
+  const std::string &leafName=images[li];
+  if(leafName.find("libsystem_kernel")==std::string::npos && leafName.find("libsystem_malloc")==std::string::npos)continue;
+  for(size_t i=1;i<entry.first.size();i++) {
+   const Where w=locate(entry.first[i]);
+   const size_t wi=w.image>='a'?(size_t)(w.image-'a'):(size_t)(w.image-'A'+26);
+   if(w.image=='?' || wi>=images.size())continue;
+   if(images[wi].find("NativeAdrenoMetal")==std::string::npos && images[wi].find("libvulkan")==std::string::npos)continue;
+   askers[{w.image,w.offset}]+=entry.second;break;
+  }
+ }
+ // What the render thread waits in, between the frames of an animation: the first frame of a waiting stack in QuartzCore, the plugin or
+ // Turnip (who asked to wait), and the second one above it in QuartzCore (what for).
+ Counts waiters;
+ for(const auto &entry:waits) {
+  unsigned found=0;
+  for(size_t i=1;i<entry.first.size() && found<2;i++) {
+   const Where w=locate(entry.first[i]);
+   const size_t wi=w.image>='a'?(size_t)(w.image-'a'):(size_t)(w.image-'A'+26);
+   if(w.image=='?' || wi>=images.size())continue;
+   const std::string &name=images[wi];
+   if(name.find("QuartzCore")==std::string::npos && name.find("NativeAdrenoMetal")==std::string::npos &&
+      name.find("libvulkan")==std::string::npos)continue;
+   waiters[{w.image,w.offset}]+=entry.second;++found;
+  }
+ }
+ for(const auto &entry:waits)   // the program counter is in the system call's wrapper, the link register at its call site
+  if(entry.first.size()>1) {const Where w=locate(entry.first[1]);waited[{w.image,w.offset}]+=entry.second;}
+ std::vector<std::string> rows;
+ auto pack=[&](const char *label,const Counts &counts,unsigned most) {
+  std::vector<std::pair<uint64_t,std::pair<char,uint64_t>>> sorted;
+  for(const auto &c:counts)sorted.push_back({c.second,c.first});
+  std::sort(sorted.begin(),sorted.end(),[](const auto &a,const auto &b){return a.first>b.first;});
+  std::string line;unsigned n=0,part=0;
+  for(const auto &s:sorted) {
+   if(n++>=most)break;
+   char entry[40];snprintf(entry,sizeof entry," %c%llx=%llu",s.second.first,(unsigned long long)s.second.second,(unsigned long long)s.first);
+   if(line.size()+strlen(entry)>84){rows.push_back(line);line.clear();}
+   if(line.empty()){char head[12];snprintf(head,sizeof head,"PR%s%u",label,part++);line=head;}
+   line+=entry;
+  }
+  if(!line.empty())rows.push_back(line);
+ };
+ {
+  std::string line;char head[64];snprintf(head,sizeof head,"PRi run%llu wait%llu",(unsigned long long)running,(unsigned long long)waiting);line=head;
+  for(size_t i=0;i<images.size() && i<52;i++) {
+   const char letter=i<26?(char)('a'+i):(char)('A'+i-26);
+   char entry[64];snprintf(entry,sizeof entry," %c=%.18s:%llu",letter,images[i].c_str(),(unsigned long long)leaves[letter]);
+   if(line.size()+strlen(entry)>88){rows.push_back(line);line="PRi";}
+   line+=entry;
+  }
+  rows.push_back(line);
+ }
+ pack("s",own,200);pack("f",in,8);pack("c",sites,40);pack("w",waited,8);pack("k",askers,24);pack("x",waiters,12);
+ // The exported names dladdr gives for the shared cache's addresses at the top of the self, wait and waiter lists (the host has the cache's
+ // local symbols only, which miss its exported functions: the system call stubs among them).
+ {
+  std::vector<std::pair<uint64_t,uint64_t>> named;
+  for(const auto &known:where) {
+   const size_t wi=known.second.image>='a'?(size_t)(known.second.image-'a'):(size_t)(known.second.image-'A'+26);
+   if(known.second.image=='?' || wi>=images.size())continue;
+   const std::string &name=images[wi];
+   if(name.find("NativeAdrenoMetal")!=std::string::npos || name.find("libvulkan")!=std::string::npos)continue;
+   uint64_t count=0;
+   for(const Counts *counts:{&own,&waited,&waiters}) {
+    auto hit=counts->find({known.second.image,known.second.offset});if(hit!=counts->end())count+=hit->second;
+    hit=counts->find({known.second.image,known.second.start});if(hit!=counts->end())count+=hit->second;
+   }
+   if(count)named.push_back({count,known.first});
+  }
+  std::sort(named.begin(),named.end(),[](const auto &a,const auto &b){return a.first>b.first;});
+  std::set<std::string> said;
+  for(const auto &n:named) {
+   if(said.size()>=24)break;
+   Dl_info info{};
+   if(!dladdr((const void *)n.second,&info) || !info.dli_sname)continue;
+   const Where w=where[n.second];
+   char line[100];snprintf(line,sizeof line,"PRn %c%llx=%.40s+%llx",w.image,(unsigned long long)w.offset,info.dli_sname,
+                         (unsigned long long)(n.second-(uint64_t)info.dli_saddr));
+   if(said.insert(line).second)rows.push_back(line);
+  }
+ }
+ std::lock_guard<std::mutex> lock(gProfileRowsLock);
+ gProfileRows.swap(rows);
+}
 static void *profileLoop(void *) {
  pthread_setname_np("nb-profile");
  const mach_port_t target=gProfiled;
@@ -277,7 +493,9 @@ static void *profileLoop(void *) {
    if(depth && isRunning){running++;stacks[std::vector<uint64_t>(frames,frames+depth)]++;lastRunning=nowUs();}
    else if(depth){waiting++;waits[std::vector<uint64_t>(frames,frames+depth)]++;}
   }
-  if(running!=written && nowUs()-lastRunning>=5000000){writeProfile(stacks,waits,samples,running,waiting,since,names);written=running;}
+  if(running!=written && nowUs()-lastRunning>=5000000) {
+   writeProfile(stacks,waits,samples,running,waiting,since,names);summarizeProfile(stacks,waits,running,waiting);written=running;
+  }
  }
  return nullptr;
 }
@@ -340,7 +558,7 @@ static Timed gTimeRegion;
 static std::atomic<uint64_t> gRegionBytes;
 // What the scanout copy costs, as the plugin's scanout service last reported it (gpupresent::Cost, native_bridge_metal_present_cost): frames,
 // then import, texture, encode, submit and wait in nanoseconds, the copy form each frame took, and the textures made and reused (the A4 row).
-static std::atomic<uint64_t> gPresent[6],gPresentForms[3],gPresentTextures[2],gPresentGeo[6];
+static std::atomic<uint64_t> gPresent[6],gPresentForms[4],gPresentTextures[2],gPresentGeo[6];
 // The runtime's copy census and buffer-texture census (nmb_copy_census, seven words and five), read for the A5 and A6 rows.
 static std::atomic<uint64_t> gCopy[7],gBufTex[5];
 // The runtime's own phasing of a draw, a pass's close and a commit (nmb_phase_timings, fourteen words): where inside those three calls the
@@ -460,6 +678,7 @@ NB_RESOURCE_SPI
  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
+ ++tTextureOps;
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  const uint64_t began=nowUs();
@@ -486,19 +705,41 @@ NB_RESOURCE_SPI
 // owners keep the mapping live through this phase. Maintain each exact CPU
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
+// The surfaces a command buffer uses, their CPU-written lines cleaned to DRAM before the GPU reads them: the GPU maps these imports
+// non-coherent, and sys_dcache_flush does nothing on Apple's arm64, whose caches are coherent with its GPU (2026-10-25: 50 GB "flushed" in
+// 0.7 ms). A surface is cleaned the first time a command buffer here uses it and whenever its seed (IOSurface bumps it at each unlock after a
+// write) differs from the one it was cleaned at; a GPU-written one keeps its seed and is not walked again. The kernel's own cleaning of
+// every read-only import at every submission (about 7 MB and 1.2 ms a submission while apps opened) is off for clients of this frontend
+// (GpuProbe.cpp: native_adreno_readonly_imports_owned). DC CVAC at EL0 is allowed (XNU sets SCTLR_EL1.UCI); 64 bytes is the Cortex-A55's and
+// A77's line (CTR_EL0 is not readable here without SCTLR_EL1.UCT).
+static std::mutex gSurfaceSeedLock;
+static std::unordered_map<uint32_t,uint32_t> gSurfaceSeeds;   // IOSurfaceID: the seed it was last cleaned at
+static std::atomic<uint64_t> gSurfaceCleanSkips;
+static void cleanToCoherency(uintptr_t start,size_t bytes) {
+ for(uintptr_t at=start&~(uintptr_t)63,end=start+bytes;at<end;at+=64)__asm__ volatile("dc cvac, %0"::"r"(at):"memory");
+ __asm__ volatile("dsb sy":::"memory");
+}
 static void flushSurfaces(NSMutableSet *surfaces) {
  if(!surfaces.count)return;
- std::vector<std::pair<uintptr_t,size_t>> ranges;
+ struct Range {uintptr_t base;size_t bytes;uint32_t id,seed;};
+ std::vector<Range> ranges;
  ranges.reserve(surfaces.count);
- for(NBTexture *texture in surfaces)if(texture.surface)
-  ranges.emplace_back(reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(texture.surface)),IOSurfaceGetAllocSize(texture.surface));
- std::sort(ranges.begin(),ranges.end());
- const auto last=std::unique(ranges.begin(),ranges.end());
+ for(NBTexture *texture in surfaces)if(IOSurfaceRef surface=texture.surface)
+  ranges.push_back({reinterpret_cast<uintptr_t>(IOSurfaceGetBaseAddress(surface)),IOSurfaceGetAllocSize(surface),IOSurfaceGetID(surface),
+                    IOSurfaceGetSeed(surface)});
+ std::sort(ranges.begin(),ranges.end(),[](const Range &a,const Range &b){return a.base<b.base;});
+ const auto last=std::unique(ranges.begin(),ranges.end(),[](const Range &a,const Range &b){return a.base==b.base;});
  gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
  for(auto it=ranges.begin();it!=last;++it) {
+  {
+   std::lock_guard<std::mutex> lock(gSurfaceSeedLock);
+   auto known=gSurfaceSeeds.find(it->id);
+   if(known!=gSurfaceSeeds.end() && known->second==it->seed){gSurfaceCleanSkips++;continue;}
+   gSurfaceSeeds[it->id]=it->seed;
+  }
   const uint64_t began=nowUs();
-  sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
-  gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
+  cleanToCoherency(it->base,it->bytes);
+  gSurfaceFlushBytes+=it->bytes;gTimeSurfaceFlush.add(began);
  }
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
@@ -1106,6 +1347,7 @@ static NSString *describeCensusTexture(id<MTLTexture> t) {
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ ++tBufferOps;
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  const uint64_t began=nowUs();
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
@@ -1288,6 +1530,7 @@ static void scheduled(void *context);
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
   const uint32_t index=(uint32_t)(gCommits.fetch_add(1)+1);self.commitIndex=index;
+  encodedWork.tex=tTextureOps;encodedWork.buf=tBufferOps;tTextureOps=tBufferOps=0;
   CommitRecord &r=gCommitRing[index%32];
   r={};r.index=index;r.committedUs=self.committedUs;r.ageUs=self.committedUs-createdUs;r.work=encodedWork;
  }
@@ -1341,9 +1584,14 @@ static void completed(void *context) {
   const uint64_t gpu=(gpuEnd>gpuStart && gpuStart>0)?(uint64_t)((gpuEnd-gpuStart)*1e6):0;
   if(gpu){gGpuTimed++;gGpuUs+=gpu;
    if(commandBuffer->encodedWork.passes){gGpuPassUs+=gpu;gGpuPassN++;}else{gGpuCopyUs+=gpu;gGpuCopyN++;}}else gGpuUntimed++;
-  std::lock_guard<std::mutex> lock(gCommitLock);
-  CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
-  if(r.index==commandBuffer.commitIndex){r.callbackUs=took;r.gpuUs=gpu;}
+  CommitRecord record{};
+  {
+   std::lock_guard<std::mutex> lock(gCommitLock);
+   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
+   if(r.index==commandBuffer.commitIndex){r.callbackUs=took;r.gpuUs=gpu;record=r;}
+  }
+  if(record.index==commandBuffer.commitIndex)
+   noteCommitWork(record,(uint32_t)(gpu>0xffffffffu?0xffffffffu:gpu));
  }
  [commandBuffer finish];
 }
@@ -1690,6 +1938,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+ ++tBufferOps;
  const uint64_t began=nowUs();
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);gTimeCreate.add(began);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
@@ -1714,6 +1963,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+ ++tTextureOps;
  const uint64_t began=nowUs();
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);gTimeCreate.add(began);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
@@ -1906,12 +2156,13 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
  // -[CIContext initWithOptions:], CoreImage 0x197550218), and with every family withheld it takes the OpenGL ES fallback this port has
  // none of (CI::GLContext::init filled a zero function table and jumped to 0: Preferences in Accessibility and iconservicesagent,
  // 2026-10-25). Answering it everywhere stalled the render server at boot (rounds 084558 and 085127: 13-24 commits, then nothing,
- // SpringBoard twelve threads all waiting), so it stays off for the render server and the icon daemon; set NMB_APPLE2_CLIENTS to a
- // comma-separated list to widen it. Core Animation's framebuffer-fetch blend reads Apple1 alone, so withholding 1001 keeps that cheap.
+ // SpringBoard twelve threads all waiting), so it stays off for the render server; set NMB_APPLE2_CLIENTS to a comma-separated list
+ // to change who gets it. The icon daemon has it too since 2026-10-25: without it every graphic symbol icon (Settings' rows) crashed
+ // iconservicesagent in CI::GLContext::init (+[CUIShapeEffectStack sharedCIContext]) and those icons stayed blank. Core Animation's framebuffer-fetch blend reads Apple1 alone, so withholding 1001 keeps that cheap.
  static const SEL family=sel_registerName("supportsFamily:");
  static const bool withholdApple1=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple1-family");}();
  static const bool withholdApple=[]{const char *w=getenv("NMB_WITHHOLD");return w && strstr(w,"apple-families");}();
- static const bool apple2Client=[]{const char *list=getenv("NMB_APPLE2_CLIENTS");if(!list)list="Preferences";
+ static const bool apple2Client=[]{const char *list=getenv("NMB_APPLE2_CLIENTS");if(!list)list="Preferences,iconservicesagent";
   const char *name=getprogname();if(!name)return false;const size_t len=strlen(name);
   for(const char *at=list;*at;) {const char *end=strchr(at,',');const size_t part=end?(size_t)(end-at):strlen(at);
    if(part==len && !strncmp(at,name,len))return true;if(!end)break;at=end+1;}
@@ -2106,7 +2357,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
  // Turnip's own render pass notes (tu_util.cc, exported as tu_pipa_note_dump): Turnip has no log route in the render server, and its
  // pass geometry (area, format, samples, mode, tile size, GMEM offset) is what tells GMEM's 4-row slices apart (2026-10-24).
- static unsigned (*turnipNotes)(char *, unsigned);static int turnipTried;
+ static unsigned (*turnipNotes)(char *, unsigned);static unsigned (*turnipKernel)(char *, unsigned);static unsigned (*turnipPasses)(char *, unsigned);
+ static int turnipTried;
  if(!turnipTried) {
   turnipTried=1;
   Dl_info info={};
@@ -2115,7 +2367,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    char *slash=strrchr(path,'/');
    if(slash) {
     snprintf(slash+1,sizeof path-(size_t)(slash+1-path),"libvulkan_freedreno.dylib");
-    if(void *lib=dlopen(path,RTLD_NOW|RTLD_LOCAL)) turnipNotes=(unsigned (*)(char *,unsigned))dlsym(lib,"tu_pipa_note_dump");
+    if(void *lib=dlopen(path,RTLD_NOW|RTLD_LOCAL)) {
+     turnipNotes=(unsigned (*)(char *,unsigned))dlsym(lib,"tu_pipa_note_dump");
+     turnipKernel=(unsigned (*)(char *,unsigned))dlsym(lib,"tu_pipa_knl_dump");
+     turnipPasses=(unsigned (*)(char *,unsigned))dlsym(lib,"tu_pipa_pass_dump");
+    }
    }
   }
  }
@@ -2132,6 +2388,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
  auto mean=[](const Timed &t){const uint64_t n=t.count.load();return (unsigned long long)(n?t.total.load()/n:0);};
  readCopyCensus();
+ // While the render thread's profile has rows (summarizeProfile), the rows that only describe single events or the corner work give way to it.
+ bool profiling;
+ {std::lock_guard<std::mutex> lock(gProfileRowsLock);profiling=!gProfileRows.empty();}
  row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
@@ -2143,13 +2402,34 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gFrameCores[7].load());
  row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
   ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)mean(gTimeEncodeToCommit));
+ // The 5 s windows (W5): whether a stall comes every so often or at random. fps is the window's frames over its whole span (a screen at rest
+ // shows few frames and no slow ones); on/late/slow count the frame intervals up to 16.7 ms, 17 to 33 and 33 and past, intervals under
+ // 200 ms only; gpu is the frames' GPU mean and p99 in µs, rp their render passes a frame times ten, kpx their pixels (in 1024s) a frame.
+ // X counts the commits past 8, 16 and 32 ms of GPU time, and past 16 and 32 ms of commit-to-callback, since the process began. H1..H5 are
+ // the heaviest commits of the last minute, heaviest first: when one committed (seconds of uptime), what it held, and the textures (a
+ // replaceRegion, a texture made, a surface imported) and buffers (a buffer made, a buffer-to-texture copy) that led to it.
+ {
+  std::lock_guard<std::mutex> lock(gWindowLock);
+  const FrameWindow &w=gWindow;
+  row("W5 fps=%llu on=%u late=%u slow=%u gpu=%llu p99=%llu rp=%llu kpx=%llu",(unsigned long long)w.fps,w.onTime,w.late,w.slow,
+   (unsigned long long)w.mean,(unsigned long long)w.p99,(unsigned long long)w.rpX10,(unsigned long long)w.kpxMean);
+  row("X spikes gpu8=%llu gpu16=%llu gpu32=%llu ctc16=%llu ctc32=%llu",(unsigned long long)w.spikes[0],(unsigned long long)w.spikes[1],
+   (unsigned long long)w.spikes[2],(unsigned long long)w.spikes[3],(unsigned long long)w.spikes[4]);
+  HeavyCommit heavy[5];
+  memcpy(heavy,w.heavy,sizeof heavy);
+  std::sort(heavy,heavy+5,[](const HeavyCommit &a,const HeavyCommit &b){return a.gpu>b.gpu;});
+  for(unsigned i=0;i<5 && !profiling;i++)if(heavy[i].at)
+   row("H%u t=%llu.%03llus rp=%u dr=%u kpx=%llu tex=%u buf=%u gpu=%u ctc=%u",i+1,(unsigned long long)(heavy[i].at/1000000),
+    (unsigned long long)((heavy[i].at/1000)%1000),heavy[i].passes,heavy[i].draws,(unsigned long long)heavy[i].kpx,heavy[i].tex,heavy[i].buf,
+    heavy[i].gpu,heavy[i].ctc);
+ }
  row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
- row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
- row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
-  (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
-  (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("J surface clean n=%llu %lluMB dup=%llu same seed %llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
+  (unsigned long long)(gSurfaceFlushBytes.load()>>20),(unsigned long long)gSurfaceFlushDuplicates.load(),
+  (unsigned long long)gSurfaceCleanSkips.load(),(unsigned long long)gTimeSurfaceFlush.total.load(),
+  (unsigned long long)gTimeSurfaceFlush.slowest.load());
  // The frame's CPU by class of call (count, total and mean per call; the draws' slowest too): the draws, every bind that sets one up
  // (buffers, textures, samplers, inline bytes, the pipeline state), the blit encoder's copies, the pass's open and its close, and the commit
  // with the surfaces it flushes. The frontend only calls the runtime, so a draw or a bind past a few microseconds is time the runtime and
@@ -2170,7 +2450,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  // The draws by what they cost (count, total, mean): the first of each render encoder, then the later ones by whether the pipeline state
  // changed since the draw before (A3). A draw is a few microseconds of frontend and one call into the runtime, so the rest is the runtime's and
  // Turnip's work inside it.
- row("A3 draw first %llu %llums/%lluus | state %llu %llums/%lluus | same %llu %llums/%lluus",(unsigned long long)gTimeDrawFirst.count.load(),
+ if(!profiling)row("A3 draw first %llu %llums/%lluus | state %llu %llums/%lluus | same %llu %llums/%lluus",(unsigned long long)gTimeDrawFirst.count.load(),
   ms(gTimeDrawFirst.total.load()),mean(gTimeDrawFirst),(unsigned long long)gTimeDrawNewState.count.load(),ms(gTimeDrawNewState.total.load()),
   mean(gTimeDrawNewState),(unsigned long long)gTimeDrawSameState.count.load(),ms(gTimeDrawSameState.total.load()),mean(gTimeDrawSameState));
  // The scanout copy, as the service that runs it reports (gpupresent::Cost): frames served, the copy form each took (bytes run together / the
@@ -2178,8 +2458,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  // The scanout copy, as the service that runs it reports (gpupresent::Cost): the frames served, the copy form each took (the frame's rows
  // and the scanout's run together / the frame as a linear texture over its pages / row by row), the geometry, and the textures it made
  // and reused. Its five steps are the A5 row.
- row("A4 present %llu %llu/%llu/%llu geo %llux%llu/%llu o%llux%llu/%llu tx%llu/%llu",(unsigned long long)gPresent[0].load(),
+ row("A4 present %llu %llu/%llu/%llu/%llu geo %llux%llu/%llu o%llux%llu/%llu tx%llu/%llu",(unsigned long long)gPresent[0].load(),
   (unsigned long long)gPresentForms[0].load(),(unsigned long long)gPresentForms[1].load(),(unsigned long long)gPresentForms[2].load(),
+  (unsigned long long)gPresentForms[3].load(),
   (unsigned long long)gPresentGeo[0].load(),(unsigned long long)gPresentGeo[1].load(),(unsigned long long)gPresentGeo[2].load(),
   (unsigned long long)gPresentGeo[3].load(),(unsigned long long)gPresentGeo[4].load(),(unsigned long long)gPresentGeo[5].load(),
   (unsigned long long)gPresentTextures[0].load(),(unsigned long long)gPresentTextures[1].load());
@@ -2196,18 +2477,18 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gCopy[4].load(),(unsigned long long)gCopy[5].load(),(unsigned long long)gCopy[6].load());
  // The buffer textures the runtime made: those whose linear image is the buffer's own bytes (alias), those whose is not, and the last one's
  // row pitch against the driver's, which decides it: the driver's linear pitch is Metal's only when it is 256-byte aligned.
- row("A6 buffer tex alias%llu no%llu pitch %llu/%llu align%llu",(unsigned long long)gBufTex[0].load(),(unsigned long long)gBufTex[1].load(),
+ if(!profiling)row("A6 buffer tex alias%llu no%llu pitch %llu/%llu align%llu",(unsigned long long)gBufTex[0].load(),(unsigned long long)gBufTex[1].load(),
   (unsigned long long)gBufTex[2].load(),(unsigned long long)gBufTex[3].load(),(unsigned long long)gBufTex[4].load());
  // The encoder's state calls, by class (count, total and mean), and the sets each class skipped because they changed nothing: a frame's
  // draws and passes come to about 5 ms, so a frame's CPU above that is here, in CA's own work, or in calls not yet counted.
- row("A7 ps %llu %llums/%lluus sk%llu | vp %llu %llums/%lluus sk%llu | sc %llu %llums/%lluus sk%llu",
+ if(!profiling)row("A7 ps %llu %llums/%lluus sk%llu | vp %llu %llums/%lluus sk%llu | sc %llu %llums/%lluus sk%llu",
   (unsigned long long)gTimeState[kStatePipeline].count.load(),ms(gTimeState[kStatePipeline].total.load()),mean(gTimeState[kStatePipeline]),
   (unsigned long long)gStateSkipped[kStatePipeline].load(),
   (unsigned long long)gTimeState[kStateViewport].count.load(),ms(gTimeState[kStateViewport].total.load()),mean(gTimeState[kStateViewport]),
   (unsigned long long)gStateSkipped[kStateViewport].load(),
   (unsigned long long)gTimeState[kStateScissor].count.load(),ms(gTimeState[kStateScissor].total.load()),mean(gTimeState[kStateScissor]),
   (unsigned long long)gStateSkipped[kStateScissor].load());
- row("A8 ds %llu %llums/%lluus sk%llu | ra %llu %llums/%lluus sk%llu | mix %llu %llums/%lluus | new %llu %llums",
+ if(!profiling)row("A8 ds %llu %llums/%lluus sk%llu | ra %llu %llums/%lluus sk%llu | mix %llu %llums/%lluus | new %llu %llums",
   (unsigned long long)gTimeState[kStateDepthStencil].count.load(),ms(gTimeState[kStateDepthStencil].total.load()),
   mean(gTimeState[kStateDepthStencil]),(unsigned long long)gStateSkipped[kStateDepthStencil].load(),
   (unsigned long long)gTimeState[kStateRaster].count.load(),ms(gTimeState[kStateRaster].total.load()),mean(gTimeState[kStateRaster]),
@@ -2232,8 +2513,6 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)(gPhase[9].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),
   (unsigned long long)(gPhase[10].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),(unsigned long long)gPhase[13].load());
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
- row("T function n=%llu total=%llums max=%llums",
-  (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu | region n=%llu %llums/%lluus %lluMB",(unsigned long long)gNoCopyAll.load(),
   (unsigned long long)gNoCopyReleased.load(),(unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load(),
@@ -2252,17 +2531,19 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  }
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
-  char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
+  char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);if(!profiling)row("F %.86s",formats);
   const SurfaceRefusal &r=gSurfaceLastRefusal;
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
    (unsigned long long)r.height,r.pixelFormat);
-  row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
-  row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
+  if(!profiling) {
+   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
+   row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
+  }
  }
  {
   std::lock_guard<std::mutex> lock(gWaitSiteLock);
-  for(unsigned i=0;i<2 && gWaitSites[i].count;i++) {
+  for(unsigned i=0;i<2 && gWaitSites[i].count && !profiling;i++) {
    const WaitSite &w=gWaitSites[i];
    row("C%u x%llu %c%lx %c%lx %c%lx %c%lx",i,(unsigned long long)w.count,w.image[0]?w.image[0]:'-',(unsigned long)w.offset[0],
     w.image[1]?w.image[1]:'-',(unsigned long)w.offset[1],w.image[2]?w.image[2]:'-',(unsigned long)w.offset[2],
@@ -2270,27 +2551,44 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   }
  }
  {
-  const unsigned have=gPassShapeCount.load()<3?gPassShapeCount.load():3;
+  const unsigned have=profiling?0:gPassShapeCount.load()<3?gPassShapeCount.load():3;
   for(unsigned i=0;i<have;i++)
    row("Y pass %ux%u f%u s%u n%llu",gPassShapes[i].width,gPassShapes[i].height,gPassShapes[i].format,gPassShapes[i].samples,
     (unsigned long long)gPassShapes[i].count.load());
  }
- {
-  std::lock_guard<std::mutex> lock(gCommitLock);
-  const uint32_t newest=(uint32_t)gCommits.load();
-  row("%s","Q timing v2: per-buffer API counts; ctc=commit-to-callback; age includes caller idle");
-  // The last four commits only: the ring is the row budget's most expensive part, and the heaviest commit is among the last few.
-  for(uint32_t k=0;k<2 && k<newest;k++) {
-   const CommitRecord &r=gCommitRing[(newest-k)%32];
-   if(r.index!=newest-k)continue;
-   row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus gpu=%lluus",r.index,(unsigned long long)(r.committedUs/1000000),
-    (unsigned long long)((r.committedUs/1000)%1000),r.work.passes,r.work.draws,(unsigned long long)(r.work.pixels>>10),r.work.dispatches,r.work.blits,
-    (unsigned long long)r.callbackUs,(unsigned long long)r.gpuUs);
-   if(k==0)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
-  }
- }
  // The benchmark's rows (native_bridge_metal_benchmark) are for the host tools, which read the table whole.
  {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
+ // The render passes' GPU time by area and mode (Turnip's tu_pipa_pass_dump, summed since the process began), most first.
+ if(turnipPasses) {
+  static char passes[1200];static unsigned passBytes;
+  {char fresh[1200];unsigned n=turnipPasses(fresh,sizeof fresh);if(n){memcpy(passes,fresh,n+1);passBytes=n;}}
+  for(char *line=passes;line<passes+passBytes;) {
+   char *eol=strchr(line,'\n');if(!eol)break;
+   row("%.*s",(int)(eol-line),line);
+   line=eol+1;
+  }
+ }
+ // Turnip's kernel calls (tu_knl_darwin.cc tu_pipa_knl_dump): per ABI method the calls and their milliseconds, then the BOs made by
+ // name; the render thread spent a fifth of its CPU in IOConnectCallStructMethod in the App Library (2026-10-25 profile).
+ if(turnipKernel) {
+  char kernel[1600];unsigned n=turnipKernel(kernel,sizeof kernel),names=0;
+  for(char *line=kernel;line<kernel+n;) {
+   char *eol=strchr(line,'\n');if(!eol)break;*eol=0;
+   // The per-method row whole (it runs over two or three rows), the BO names only as far as the first four: the profile rows follow.
+   if(*line && (strncmp(line,"KB",2) || names++<4))
+    for(size_t at=0,length=strlen(line);at<length;at+=86)row(at?"KM+ %.86s":"%.86s",line+at);
+   line=eol+1;
+  }
+ }
+ // The render thread's profile (summarizeProfile), as many of its rows as the 48 leave, the next ones at the next dump; ahead of Turnip's notes.
+ {
+  std::lock_guard<std::mutex> lock(gProfileRowsLock);
+  static size_t next;
+  const size_t total=gProfileRows.size();
+  size_t sent=0;
+  for(;sent<total && rows<48;sent++)row("%s",gProfileRows[(next+sent)%total].c_str());
+  if(total)next=(next+sent)%total;
+ }
  // Turnip's own render pass notes (tu_util.cc, exported as tu_pipa_note_dump): Turnip has no log route in the render server, and its
  // pass geometry (area, format, samples, mode, tile size, GMEM offset) is what tells GMEM's 4-row slices apart (2026-10-24). Last, so the
  // rows above are never pushed out of the kernel's 48 (the corner work that needs these can move them up).
@@ -2317,6 +2615,7 @@ extern "C" void native_bridge_metal_present_cost(const uint64_t *values) {
  gPresentForms[0].store(values[6]);gPresentForms[1].store(values[7]);gPresentForms[2].store(values[8]);
  gPresentTextures[0].store(values[9]);gPresentTextures[1].store(values[10]);
  for(unsigned i=0;i<6;i++)gPresentGeo[i].store(values[11+i]);
+ gPresentForms[3].store(values[17]);
 }
 
 extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {

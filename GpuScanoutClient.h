@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
 #include "ScaleKernelAir.h"
+#include "CopyRowsAir.h"
 #include "../NativeMobileDisplay/NativeGOPWire.h"
 
 // The render thread's frames and CPU time (NativeBridgeMetalFrontend.mm); absent where the native frontend is not linked (host checks).
@@ -82,6 +83,13 @@ public:
             presenter_->setScaler(scaler);
             stats_->scaler = scaler ? 1 : !library ? 2 : !function ? 3 : 4;
             note(scaler ? 0x6716 : 0x67f0 | (uint32_t)stats_->scaler);
+            // The copy kernel, for a frame whose pitch is not the scanout's: without it the copy stays the blit of the frame's texture.
+            id<MTLLibrary> copyLibrary = native_bridge_metal_library_with_air(kCopyRowsAir, kCopyRowsAirLength);
+            id<MTLFunction> copyFunction = copyLibrary ? [copyLibrary newFunctionWithName:@"copy_rows"] : nil;
+            NSError *copyError = nil;
+            id<MTLComputePipelineState> copier = copyFunction ? [device newComputePipelineStateWithFunction:copyFunction error:&copyError] : nil;
+            presenter_->setCopier(copier);
+            note(copier ? 0x6717 : 0x67f8 | (!copyLibrary ? 1u : !copyFunction ? 2u : 3u));
         }
         stats_->step = 4;
         return true;
@@ -117,10 +125,10 @@ public:
         // reused, and the geometry.
         if (native_bridge_metal_present_cost) {
             const gpupresent::Cost &cost = presenter_->cost();
-            const uint64_t values[17] = {cost.frames, cost.importNs, cost.textureNs, cost.encodeNs, cost.submitNs, cost.waitNs,
+            const uint64_t values[18] = {cost.frames, cost.importNs, cost.textureNs, cost.encodeNs, cost.submitNs, cost.waitNs,
                                          cost.forms[0], cost.forms[1], cost.forms[2], cost.texturesMade, cost.texturesReused,
                                          cost.geometry[0], cost.geometry[1], cost.geometry[2], cost.geometry[3], cost.geometry[4],
-                                         cost.geometry[5]};
+                                         cost.geometry[5], cost.forms[3]};
             native_bridge_metal_present_cost(values);
         }
         const bool scaled = swap.width != scanout_.width || swap.height != scanout_.height;

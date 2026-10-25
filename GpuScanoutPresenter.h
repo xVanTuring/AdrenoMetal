@@ -16,11 +16,12 @@ namespace gpupresent {
 
 // What a present costs, in nanoseconds, by step, and which copy form each frame took: 0 the frame's rows and the scanout's run together (one
 // buffer copy), 1 the frame as a linear texture over its pages (one buffer-image copy, or a buffer copy per row where that texture has no image
-// of its own), 2 row by row from here. Reported through native_bridge_metal_present_cost (NativeBridgeMetalFrontend.h, its A4 row).
+// of its own), 2 row by row from here, 3 the copy kernel (one dispatch, rows of 16-byte vectors). Reported through
+// native_bridge_metal_present_cost (NativeBridgeMetalFrontend.h, its A4 row).
 struct Cost {
     uint64_t frames = 0;
     uint64_t importNs = 0, textureNs = 0, encodeNs = 0, submitNs = 0, waitNs = 0;
-    uint64_t forms[3] = {};
+    uint64_t forms[4] = {};
     uint64_t texturesMade = 0, texturesReused = 0;
     // The last frame's width, height and stride, then the scanout's (its A4 row): the two pitches decide the copy's form.
     uint64_t geometry[6] = {};
@@ -79,6 +80,11 @@ public:
         if (!scaled_) scaler_ = nil;
     }
     bool scaling() const { return scaler_ != nil; }
+    // The copy kernel (shaders/copy_rows.ll), for a frame of the scanout's size whose pitch differs from the scanout's: one dispatch writes
+    // the scanout row by row from the surface pages, where the blit of the frame's linear texture is one 2D blit per row whenever the
+    // scanout's pitch is not a multiple of 64 (pipa: 7200, 2880 blits a frame). Both pitches must be multiples of 16; without the kernel
+    // the blit stays.
+    void setCopier(id<MTLComputePipelineState> copier) { copier_ = copier; }
     // Whether row y of the scanout lies in the overlay box (a read-back comparison skips it).
     bool overlayRow(uint32_t y) const { return overlay_ && y >= kOverlayY && y < kOverlayY + kOverlayHeight; }
     // A small opaque box near the top left of the panel, copied by the GPU over each frame right after the frame itself, so no CPU store
@@ -153,11 +159,29 @@ public:
         // What the frame's import, its texture and the copy's encoding cost (cost), and which form the copy takes.
         uint64_t step = nowNs();
         cost_.importNs += step - began;
+        uint32_t form = 0;
+        const bool kernelCopy = !scaled && copier_ && frame.stride != scanout_.stride && !(frame.stride & 15) && !(scanout_.stride & 15) &&
+                                !(row & 15);
+        if (kernelCopy) {
+            // One thread a 16-byte vector of a row; a threadgroup is a run of one row, so the scanout is written front to back.
+            id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
+            if (!compute) return kNoResource;
+            const uint32_t params[4] = {(uint32_t)(row / 16), frame.height, (uint32_t)(frame.stride / 16), (uint32_t)(scanout_.stride / 16)};
+            const NSUInteger side = copier_.maxTotalThreadsPerThreadgroup >= 128 ? 128 : 64;
+            [compute setComputePipelineState:copier_];
+            [compute setBuffer:source offset:0 atIndex:0];
+            [compute setBuffer:target_ offset:0 atIndex:1];
+            [compute setBytes:params length:sizeof params atIndex:2];
+            [compute dispatchThreadgroups:MTLSizeMake((params[0] + side - 1) / side, frame.height, 1) threadsPerThreadgroup:MTLSizeMake(side, 1, 1)];
+            [compute endEncoding];
+            form = 3;
+        }
         // The copy of the frame (or of its scaled image) onto the scanout, and the overlay after it.
         id<MTLBlitCommandEncoder> blit = [commands blitCommandEncoder];
         if (!blit) return kNoResource;
-        uint32_t form = 0;
-        if (scaled) {
+        if (kernelCopy) {
+            // The dispatch above wrote the frame; the blit encoder carries only the overlay.
+        } else if (scaled) {
             [blit copyFromBuffer:scaled_ sourceOffset:0 toBuffer:target_ destinationOffset:0
                             size:scanout_.stride * (scanout_.height - 1) + (size_t)scanout_.width * 4];
         } else if (frame.stride == scanout_.stride) {
@@ -221,7 +245,7 @@ public:
         [commands waitUntilCompleted];
         cost_.waitNs += nowNs() - step;
         ++cost_.frames;
-        ++cost_.forms[form < 3 ? form : 0];
+        ++cost_.forms[form < 4 ? form : 0];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
     // The cost so far, and the copy forms taken (Cost).
@@ -260,6 +284,7 @@ private:
     id<MTLBuffer> overlayBuffer_;
     id<MTLTexture> overlay_;
     id<MTLComputePipelineState> scaler_;
+    id<MTLComputePipelineState> copier_;
     id<MTLBuffer> scaled_;   // the scaled frame, in the scanout's layout, before the blit onto the scanout
     struct Cached {uint32_t tag = 0; const void *base = nullptr; size_t bytes = 0; size_t stride = 0; uint32_t width = 0, height = 0;
                    id<MTLBuffer> buffer; id<MTLTexture> texture;};
