@@ -117,6 +117,13 @@ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;uint3
 // A53s, 4-7 the A73s). A gap past 200 ms is the compositor at rest and is not counted.
 static std::atomic<uint64_t> gFrameCostN,gFrameCpuUs,gFrameWallUs,gFrameCores[8];
 static void startProfile();
+// The render thread's long intervals between two frames (40 ms to 2 s) and the CPU it spent in them: whether a stutter at the start or end
+// of an animation (60 to 130 ms, 2026-10-25, while the frames around it took 16) is the render server busy (its CPU near the interval) or
+// left without an update to draw (near none). The last 8, the L rows.
+struct LongFrame {uint64_t at,gapUs,cpuUs;};
+static LongFrame gLongFrames[8];
+static std::atomic<uint32_t> gLongFrameCount;
+static std::mutex gLongFrameLock;
 static void noteFrameCost() {
  static thread_local uint64_t lastCpu,lastWall;
  static std::atomic<uint32_t> renderCommits;
@@ -131,6 +138,10 @@ static void noteFrameCost() {
  const uint64_t wall=nowUs();
  if(core<8)gFrameCores[core]++;
  if(lastWall && wall-lastWall<200000){gFrameCostN++;gFrameCpuUs+=cpu-lastCpu;gFrameWallUs+=wall-lastWall;}
+ if(lastWall && wall-lastWall>=40000 && wall-lastWall<2000000) {
+  std::lock_guard<std::mutex> lock(gLongFrameLock);
+  gLongFrames[gLongFrameCount.fetch_add(1)%8]={wall,wall-lastWall,cpu-lastCpu};
+ }
  lastCpu=cpu;lastWall=wall;
 }
 struct CommitRecord {uint64_t committedUs=0,callbackUs=0,ageUs=0,gpuUs=0;int64_t scheduledUs=-1;uint32_t index=0;EncodedWork work={};};
@@ -2512,6 +2523,17 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)(gPhase[8].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),
   (unsigned long long)(gPhase[9].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),
   (unsigned long long)(gPhase[10].load()/1000/(gPhase[13].load()?gPhase[13].load():1)),(unsigned long long)gPhase[13].load());
+ {
+  std::lock_guard<std::mutex> lock(gLongFrameLock);
+  const uint32_t count=gLongFrameCount.load();
+  char text[96];unsigned used=(unsigned)snprintf(text,sizeof text,"L n%u",count);
+  for(uint32_t i=count>4?count-4:0;i<count && used<sizeof text;i++) {
+   const LongFrame &f=gLongFrames[i%8];
+   used+=(unsigned)snprintf(text+used,sizeof text-used," %llu.%01llu:%llu/%llu",(unsigned long long)(f.at/1000000),
+    (unsigned long long)((f.at/100000)%10),(unsigned long long)(f.gapUs/1000),(unsigned long long)(f.cpuUs/1000));
+  }
+  if(count)row("%s",text);
+ }
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu | region n=%llu %llums/%lluus %lluMB",(unsigned long long)gNoCopyAll.load(),
   (unsigned long long)gNoCopyReleased.load(),(unsigned long long)gNoCopyMade.load(),
