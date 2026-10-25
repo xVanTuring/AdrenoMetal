@@ -16,6 +16,8 @@ size_t native_bridge_metal_status(char *out, size_t size);
 // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
 size_t native_bridge_metal_formats(char *out, size_t size);
 size_t native_bridge_metal_telemetry(char *out, size_t size);
+// A client process's compile cost so far as one short line (the plugin streams it into the process's kernel row).
+size_t native_bridge_metal_client_brief(char *out, size_t size);
 // The render thread's frames so far (commits with a render pass, the U row) and their CPU time in microseconds, for the frame-rate overlay.
 void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us);
 // What the scanout copy costs, by step, in nanoseconds (gpupresent::Cost in GpuScanoutPresenter.h, its A4 and A5 rows): frames served, then

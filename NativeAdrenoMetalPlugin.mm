@@ -163,6 +163,23 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
         streamText(*gpu, text);
     }
 }
+// A client's compile cost (native_bridge_metal_client_brief) into its kernel row, each second it changed for its first ten minutes:
+// whether a slow first start (Settings, 2026-10-25) is the shader compiles or something else.
+static void clientReport(unsigned port) {
+    Gpu *gpu = makeGpu(port);
+    if (!gpu) return;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, [](void *argument) -> void * {
+            Gpu *g = static_cast<Gpu *>(argument);
+            char last[64] = {}, text[64];
+            for (unsigned second = 0; second < 600; ++second) {
+                sleep(1);
+                native_bridge_metal_client_brief(text, sizeof text);
+                if (strcmp(text, last)) {strlcpy(last, text, sizeof last); streamText(*g, text);}
+            }
+            return nullptr;
+        }, gpu) == 0) pthread_detach(thread);
+}
 static id clientDevice(unsigned port) {
     if (!listedClient()) return nil;
     char turnip[1024];
@@ -195,6 +212,7 @@ static id clientDevice(unsigned port) {
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+    else clientReport(port);
     return device;
 }
 // Turnip options a board asks for through the accelerator's NativeTurnipDebug property: they replace this plugin's default below

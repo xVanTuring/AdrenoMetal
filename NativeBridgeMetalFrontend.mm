@@ -2603,6 +2603,22 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  return at;
 }
 
+// A client process's compile cost so far, one line for its kernel row (NativeAdrenoMetalPlugin.mm clientReport): seconds since its device
+// opened, the Metal pipeline states it made (count, ms, slowest ms), the runtime's VkPipelines, made at draws (count, ms), its shader
+// cache's hits and misses, and the libraries and functions made (count, ms). Settings took seconds to show its content the first time
+// after a boot (2026-10-25), and the render server's table sees no other process's compiles.
+extern "C" size_t native_bridge_metal_client_brief(char *out,size_t size) {
+ auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
+ uint64_t work[10]={};
+ if(gDevice)nmb_device_work_stats(gDevice,work);
+ const int n=snprintf(out,size,"t%llu p%llu/%llu/%llu v%llu/%llu c%llu/%llu l%llu/%llu f%llu/%llu",
+  gJournalBegan?(unsigned long long)((nowUs()-gJournalBegan)/1000000):0ULL,(unsigned long long)gTimePipeline.count.load(),
+  ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()),(unsigned long long)work[0],ms(work[1]),(unsigned long long)work[7],
+  (unsigned long long)work[8],(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),
+  (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()));
+ return n>0?(size_t)n:0;
+}
+
 extern "C" void native_bridge_metal_frame_cost(uint64_t *frames,uint64_t *cpu_us) {
  if(frames)*frames=gFrameCostN.load();
  if(cpu_us)*cpu_us=gFrameCpuUs.load();
