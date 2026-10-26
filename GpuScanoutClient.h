@@ -21,6 +21,8 @@ extern "C" void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_u
 extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
 // What the scanout copy costs, by step (NativeBridgeMetalFrontend.h's A4 row); absent where the frontend is not linked.
 extern "C" void native_bridge_metal_present_cost(const uint64_t *values) __attribute__((weak_import));
+extern "C" void NBWaitInFlight(uint64_t beforeUs) __attribute__((weak_import));
+extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) __attribute__((weak_import));
 
 namespace gpuscanout {
 
@@ -109,6 +111,8 @@ public:
         }
         const size_t page = (size_t)getpagesize();
         note(0x6730);   // a frame was offered
+        const uint64_t offeredUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+        if (NBWaitInFlight) NBWaitInFlight(offeredUs);
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
                                                           (size_t)swap.stride, swap.width, swap.height, swap.reserved});
@@ -137,8 +141,10 @@ public:
         if (r == gpupresent::kOk && !scaled && stats_->verified < 4) verify(swap);
         if (r == gpupresent::kOk) updateOverlay();
         note(0x6731);   // the GPU copy returned
+        const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
         const int completed = transport_.call(transport_.context, NGP_METHOD_COMPLETE_SWAP, &done, sizeof done, nullptr, 0);
+        if (NBTraceSwap) NBTraceSwap(offeredUs, copiedUs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000, (uint32_t)swap.sequence, (uint32_t)r);
         if (completed) {++stats_->failures; stats_->error = completed; return false;}
         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
         return true;
