@@ -166,3 +166,72 @@ index 4781491..4047633 100644
  pub use capabilities::{DeviceProperties, Query};
  pub use command_buffer::checks::{Submission, SubmissionCheck};
  pub use command_buffer::{CommandBuffer, CommitFailure, FailedEncoders, Handler};
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 5cd377c..bed9bd2 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -269,6 +269,7 @@ use super::depth_stencil_scratch::{ScratchCopy, Separate};
+ use super::device::lock;
+ use super::draw_source::{CopySteps, DrawSource, IndexBind};
+ use super::dynamic_state::ExtendedDynamicState;
++use super::encoder::phases;
+ use super::encoder::{EncoderCore, Replayed};
+ use super::error::{internal, invalid, vulkan, Error, Problem, RuntimeGap};
+ use super::execution::{ExecutedPipeline, Execution};
+@@ -2989,7 +2990,10 @@ impl RenderCommandEncoder {
+     /// is left untouched, as plain Metal leaves it. The encoder is consumed either way, so a
+     /// refusal leaves its command buffer abandoned, as Metal stops there.
+     pub fn end_encoding(self) -> Result<(), Error> {
++        let close_at = std::time::Instant::now();
++        phases::counted(1);
+         let (core, residency, log) = self.end_pass()?;
++        phases::add(phases::CLOSE_END_PASS, close_at, std::time::Instant::now());
+         core.end_with_replay(
+             EncoderKind::Render,
+             Some(residency),
+@@ -5739,6 +5743,10 @@ impl RenderCommandEncoder {
+         buffers: DrawBuffers<'_>,
+         empty: bool,
+     ) -> Result<(), Error> {
++        // Where a draw's CPU time goes (the D row of the telemetry): the bind state and variant, the command it builds, the heaps and
++        // descriptors, then the record and the encoder's own bookkeeping. Diagnostic only.
++        let draw_at = std::time::Instant::now();
++        phases::counted(0);
+         let pipeline = match self.pipeline.as_ref().map(RenderPipelineState::kind) {
+             None => return Err(invalid(call, Problem::NoPipelineState)),
+             Some(RenderStateKind::Tile(_)) => {
+@@ -5895,6 +5903,8 @@ impl RenderCommandEncoder {
+             &function_tables,
+         )?;
+         let (variant, plan) = (Arc::clone(&settled.variant), Arc::clone(&settled.plan));
++        let settled_at = std::time::Instant::now();
++        phases::add(phases::DRAW_SETTLE, draw_at, settled_at);
+         self.give_up_extended_shadows(&pipeline, &live.state);
+         // A capture draw runs its variant's capture form, where its objects are made: else it
+         // records nothing, and the capture neither.
+@@ -5976,6 +5986,8 @@ impl RenderCommandEncoder {
+         let mut commands = self.draw_commands.take().unwrap_or_else(DrawCommands::empty);
+         plan.instantiate_draw_into(&live.state, &draw, &mut commands)
+             .map_err(Error::Bind)?;
++        let built_at = std::time::Instant::now();
++        phases::add(phases::DRAW_COMMANDS, settled_at, built_at);
+         self.reaches_unnamed |= !commands.root_tables.is_empty() || reads_handles(&plan);
+         // A mesh draw the binder launches no threadgroup of (as plain Metal draws nothing).
+         let empty = empty
+@@ -6594,6 +6606,8 @@ impl RenderCommandEncoder {
+                 }
+             }
+         }
++        let heaps_at = std::time::Instant::now();
++        phases::add(phases::DRAW_HEAPS, built_at, heaps_at);
+         let instance = match &next {
+             Next::Current => &self.current,
+             Next::New { instance, .. } => &**instance,
+@@ -7328,6 +7342,7 @@ impl RenderCommandEncoder {
+         // The states go; the list stays for the next draw's.
+         argument_samplers.clear();
+         self.argument_samplers_room = argument_samplers;
++        phases::add(phases::DRAW_RECORD, heaps_at, std::time::Instant::now());
+         Ok(())
+     }
+ 
