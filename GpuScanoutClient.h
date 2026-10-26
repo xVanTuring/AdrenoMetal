@@ -13,7 +13,7 @@
 #include "GpuScanoutPresenter.h"
 #include "ScaleKernelAir.h"
 #include "CopyRowsAir.h"
-#include "../NativeMobileDisplay/NativeGOPWire.h"
+#include "../GopFramebuffer/NativeGOPWire.h"
 
 // The render thread's frames and CPU time (NativeBridgeMetalFrontend.mm); absent where the native frontend is not linked (host checks).
 extern "C" void native_bridge_metal_frame_cost(uint64_t *frames, uint64_t *cpu_us) __attribute__((weak_import));
